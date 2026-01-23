@@ -1,17 +1,80 @@
 [project]
 name = "documentindex"
 version = "0.1.0"
-description = "Add your description here"
+description = "Lightweight hierarchical tree index for financial documents"
 readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
 authors = [
-    { name = "Jason-AI-lab", email = "jzhang7@hoopp.com" }
+    {name = "Jason Zhang"}
 ]
-requires-python = ">=3.13"
-dependencies = []
+keywords = [
+    "document-index",
+    "financial-documents",
+    "sec-filings",
+    "rag",
+    "llm",
+    "tree-index",
+    "hierarchical-index",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Text Processing :: Indexing",
+]
 
-[project.scripts]
-documentindex = "documentindex:main"
+dependencies = [
+    "litellm>=1.40.0",
+    "tiktoken>=0.5.0",
+    "aiofiles>=23.0.0",
+]
+
+[project.optional-dependencies]
+cache = [
+    "redis>=5.0.0",
+]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-cov>=4.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0.0",
+]
+all = [
+    "documentindex[cache,dev]",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/documentindex"
+Documentation = "https://github.com/yourusername/documentindex#readme"
+Repository = "https://github.com/yourusername/documentindex"
 
 [build-system]
-requires = ["uv_build>=0.8.14,<0.9.0"]
-build-backend = "uv_build"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/documentindex"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
