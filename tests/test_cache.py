@@ -85,8 +85,11 @@ class TestMemoryCache:
         await cache.set("key4", "value4")  # Should trigger eviction
         
         # One of the first three keys should be evicted
-        total = sum(1 for k in ["key1", "key2", "key3", "key4"] 
-                   if await cache.get(k) is not None)
+        # Count how many keys still exist
+        total = 0
+        for k in ["key1", "key2", "key3", "key4"]:
+            if await cache.get(k) is not None:
+                total += 1
         assert total == 3
     
     def test_get_stats(self):

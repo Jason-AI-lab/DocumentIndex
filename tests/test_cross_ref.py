@@ -121,105 +121,124 @@ class TestCrossReferenceResolver:
     """Tests for cross-reference resolution"""
     
     def _create_test_index(self) -> DocumentIndex:
-        """Create a test document index with known structure"""
-        text = "x" * 1000
+        """Create a test document index with known structure and references in text"""
+        # Create text that contains cross-references
+        text_part1 = "PART I\n\nThis section discusses business. See Item 1A for risk factors.\n"
+        text_item1 = "Item 1. Business\n\nBusiness description here. Refer to Note 15 for details.\n"
+        text_item1a = "Item 1A. Risk Factors\n\nRisk factors described here.\n"
+        text_note15 = "Note 15 - Segment Information\n\nSegment details here. See Appendix G.\n"
+        text_appendix = "Appendix G - Product List\n\nProduct list here.\n"
         
-        nodes = [
-            TreeNode(
-                node_id="0001",
-                title="PART I",
-                level=0,
-                text_span=TextSpan(0, 300, 0, 3),
-            ),
-            TreeNode(
-                node_id="0002",
-                title="Item 1. Business",
-                level=1,
-                text_span=TextSpan(0, 100, 0, 1),
-            ),
-            TreeNode(
-                node_id="0003",
-                title="Item 1A. Risk Factors",
-                level=1,
-                text_span=TextSpan(100, 200, 1, 2),
-            ),
-            TreeNode(
-                node_id="0004",
-                title="Note 15 - Segment Information",
-                level=2,
-                text_span=TextSpan(300, 400, 3, 4),
-            ),
-            TreeNode(
-                node_id="0005",
-                title="Appendix G - Product List",
-                level=2,
-                text_span=TextSpan(400, 500, 4, 5),
-            ),
+        full_text = text_part1 + text_item1 + text_item1a + text_note15 + text_appendix
+        
+        # Calculate offsets
+        offset1 = 0
+        offset2 = len(text_part1)
+        offset3 = offset2 + len(text_item1)
+        offset4 = offset3 + len(text_item1a)
+        offset5 = offset4 + len(text_note15)
+        
+        # Create nodes with proper parent-child relationships
+        part1 = TreeNode(
+            node_id="0001",
+            title="PART I",
+            level=0,
+            text_span=TextSpan(offset1, offset3, 0, 2),
+        )
+        item1 = TreeNode(
+            node_id="0002",
+            title="Item 1. Business",
+            level=1,
+            text_span=TextSpan(offset2, offset3, 1, 2),
+            parent_id="0001",
+        )
+        item1a = TreeNode(
+            node_id="0003",
+            title="Item 1A. Risk Factors",
+            level=1,
+            text_span=TextSpan(offset3, offset4, 2, 3),
+            parent_id="0001",
+        )
+        note15 = TreeNode(
+            node_id="0004",
+            title="Note 15 - Segment Information",
+            level=0,
+            text_span=TextSpan(offset4, offset5, 3, 4),
+        )
+        appendix_g = TreeNode(
+            node_id="0005",
+            title="Appendix G - Product List",
+            level=0,
+            text_span=TextSpan(offset5, len(full_text), 4, 5),
+        )
+        
+        # Set up children
+        part1.children = [item1, item1a]
+        
+        # Create chunks matching the text
+        chunks = [text_part1, text_item1, text_item1a, text_note15, text_appendix]
+        chunk_offsets = [
+            (offset1, offset2),
+            (offset2, offset3),
+            (offset3, offset4),
+            (offset4, offset5),
+            (offset5, len(full_text)),
         ]
-        nodes[0].children = [nodes[1], nodes[2]]
         
         return DocumentIndex(
             doc_id="test",
             doc_name="test",
             doc_type=DocumentType.SEC_10K,
-            original_text=text,
-            chunks=["x" * 100] * 10,
-            chunk_char_offsets=[(i*100, (i+1)*100) for i in range(10)],
-            structure=nodes,
+            original_text=full_text,
+            chunks=chunks,
+            chunk_char_offsets=chunk_offsets,
+            structure=[part1, note15, appendix_g],
         )
     
     def test_resolve_item_reference(self):
+        """Test that Item 1A reference in PART I text is resolved"""
         doc_index = self._create_test_index()
         
-        # Add a reference to resolve
-        ref = CrossReference(
-            source_node_id="0002",
-            target_description="Item 1A",
-            reference_text="See Item 1A for risks.",
-        )
-        doc_index.structure[0].children[0].cross_references = [ref]
-        
         resolver = CrossReferenceResolver(CrossRefConfig(use_llm_resolution=False))
-        resolver.resolve_references_sync(doc_index)
+        all_refs = resolver.resolve_references_sync(doc_index)
         
-        # Check resolution
-        resolved_ref = doc_index.structure[0].children[0].cross_references[0]
-        assert resolved_ref.resolved is True
-        assert resolved_ref.target_node_id == "0003"
+        # Find the reference to Item 1A
+        item_refs = [r for r in all_refs if "Item 1A" in r.target_description or "item 1a" in r.target_description.lower()]
+        
+        assert len(item_refs) >= 1, f"Expected Item 1A reference, found: {[r.target_description for r in all_refs]}"
+        ref = item_refs[0]
+        assert ref.resolved is True
+        assert ref.target_node_id == "0003"
     
     def test_resolve_note_reference(self):
+        """Test that Note 15 reference in Item 1 text is resolved"""
         doc_index = self._create_test_index()
         
-        ref = CrossReference(
-            source_node_id="0002",
-            target_description="Note 15",
-            reference_text="See Note 15.",
-        )
-        doc_index.structure[0].children[0].cross_references = [ref]
-        
         resolver = CrossReferenceResolver(CrossRefConfig(use_llm_resolution=False))
-        resolver.resolve_references_sync(doc_index)
+        all_refs = resolver.resolve_references_sync(doc_index)
         
-        resolved_ref = doc_index.structure[0].children[0].cross_references[0]
-        assert resolved_ref.resolved is True
-        assert resolved_ref.target_node_id == "0004"
+        # Find the reference to Note 15
+        note_refs = [r for r in all_refs if "Note 15" in r.target_description or "note 15" in r.target_description.lower()]
+        
+        assert len(note_refs) >= 1, f"Expected Note 15 reference, found: {[r.target_description for r in all_refs]}"
+        ref = note_refs[0]
+        assert ref.resolved is True
+        assert ref.target_node_id == "0004"
     
     def test_resolve_appendix_reference(self):
+        """Test that Appendix G reference in Note 15 text is resolved"""
         doc_index = self._create_test_index()
         
-        ref = CrossReference(
-            source_node_id="0002",
-            target_description="Appendix G",
-            reference_text="See Appendix G.",
-        )
-        doc_index.structure[0].children[0].cross_references = [ref]
-        
         resolver = CrossReferenceResolver(CrossRefConfig(use_llm_resolution=False))
-        resolver.resolve_references_sync(doc_index)
+        all_refs = resolver.resolve_references_sync(doc_index)
         
-        resolved_ref = doc_index.structure[0].children[0].cross_references[0]
-        assert resolved_ref.resolved is True
-        assert resolved_ref.target_node_id == "0005"
+        # Find the reference to Appendix G
+        appendix_refs = [r for r in all_refs if "Appendix G" in r.target_description or "appendix g" in r.target_description.lower()]
+        
+        assert len(appendix_refs) >= 1, f"Expected Appendix G reference, found: {[r.target_description for r in all_refs]}"
+        ref = appendix_refs[0]
+        assert ref.resolved is True
+        assert ref.target_node_id == "0005"
 
 
 class TestCrossReferenceFollower:
