@@ -1,0 +1,3 @@
+"""
+DocumentIndex test suite.
+"""
