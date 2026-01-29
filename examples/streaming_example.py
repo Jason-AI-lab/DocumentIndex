@@ -8,6 +8,9 @@ This example demonstrates:
 """
 
 import asyncio
+import os
+from pathlib import Path
+from dotenv import load_dotenv
 from documentindex import (
     DocumentIndexer,
     AgenticQA,
@@ -15,6 +18,7 @@ from documentindex import (
     IndexerConfig,
     LLMConfig,
     ProgressUpdate,
+    create_azure_client,
 )
 
 
@@ -65,7 +69,7 @@ def create_progress_bar(pct: float, width: int = 40) -> str:
     return f"[{bar}] {pct:.1f}%"
 
 
-async def indexing_with_progress():
+async def indexing_with_progress(llm_client):
     """Example: Indexing with progress tracking"""
     print("=" * 60)
     print("EXAMPLE 1: Indexing with Progress")
@@ -79,7 +83,7 @@ async def indexing_with_progress():
             print()  # Newline at end
     
     config = IndexerConfig(
-        llm_config=LLMConfig(model="gpt-4o"),
+        llm_config=llm_client.config,
         generate_summaries=True,
     )
     indexer = DocumentIndexer(config)
@@ -99,13 +103,13 @@ async def indexing_with_progress():
     return doc_index
 
 
-async def streaming_qa(doc_index):
+async def streaming_qa(doc_index, llm_client):
     """Example: Streaming QA response"""
     print("\n" + "=" * 60)
     print("EXAMPLE 2: Streaming QA Response")
     print("=" * 60)
     
-    qa = AgenticQA(doc_index)
+    qa = AgenticQA(doc_index, llm_client=llm_client)
     
     question = "What was the revenue performance in Q4 2024?"
     print(f"\nQuestion: {question}")
@@ -122,13 +126,13 @@ async def streaming_qa(doc_index):
     print(f"Nodes visited: {len(result.nodes_visited)}")
 
 
-async def streaming_provenance(doc_index):
+async def streaming_provenance(doc_index, llm_client):
     """Example: Streaming provenance extraction"""
     print("\n" + "=" * 60)
     print("EXAMPLE 3: Streaming Provenance Results")
     print("=" * 60)
     
-    extractor = ProvenanceExtractor(doc_index)
+    extractor = ProvenanceExtractor(doc_index, llm_client=llm_client)
     
     topic = "financial metrics and performance"
     print(f"\nExtracting evidence for: '{topic}'")
@@ -150,7 +154,7 @@ async def streaming_provenance(doc_index):
     print(f"Nodes scanned: {result.total_nodes_scanned}")
 
 
-async def provenance_with_progress(doc_index):
+async def provenance_with_progress(doc_index, llm_client):
     """Example: Provenance with progress callbacks"""
     print("\n" + "=" * 60)
     print("EXAMPLE 4: Provenance with Progress")
@@ -162,7 +166,7 @@ async def provenance_with_progress(doc_index):
         if update.is_complete:
             print()
     
-    extractor = ProvenanceExtractor(doc_index)
+    extractor = ProvenanceExtractor(doc_index, llm_client=llm_client)
     
     topic = "risks and challenges"
     print(f"\nExtracting evidence for: '{topic}'\n")
@@ -186,17 +190,30 @@ async def main():
     print("DocumentIndex Streaming Examples")
     print("#" * 60)
     
+    # Load environment variables from .env file
+    env_path = Path(__file__).parent.parent / '.env'
+    load_dotenv(env_path)
+    
+    # Create Azure OpenAI client once - shared across all examples
+    llm_client = create_azure_client(
+        deployment_name=os.getenv('AZURE_OPENAI_DEPLOYMENT_NAME', 'gpt-4.1'),
+        api_base=os.getenv('AZURE_OPENAI_API_BASE'),
+        api_version=os.getenv('AZURE_OPENAI_API_VERSION', '2024-02-15'),
+        api_key=os.getenv('AZURE_OPENAI_API_KEY'),
+        temperature=0.0,
+    )
+    
     # Index with progress
-    doc_index = await indexing_with_progress()
+    doc_index = await indexing_with_progress(llm_client)
     
     # Streaming QA
-    await streaming_qa(doc_index)
+    await streaming_qa(doc_index, llm_client)
     
     # Streaming provenance
-    await streaming_provenance(doc_index)
+    await streaming_provenance(doc_index, llm_client)
     
     # Provenance with progress
-    await provenance_with_progress(doc_index)
+    await provenance_with_progress(doc_index, llm_client)
     
     print("\n" + "=" * 60)
     print("Streaming examples completed!")

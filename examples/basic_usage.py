@@ -9,13 +9,17 @@ This example demonstrates:
 """
 
 import asyncio
+import os
+from pathlib import Path
+from dotenv import load_dotenv
 from documentindex import (
     DocumentIndexer,
     NodeSearcher,
     AgenticQA,
     ProvenanceExtractor,
     IndexerConfig,
-    LLMConfig,
+    create_azure_client,
+    create_bedrock_client,
 )
 
 # Sample 10-K document (abbreviated for example)
@@ -99,16 +103,51 @@ The Company operates in three reportable segments:
 Each segment is managed separately based on the products and services offered.
 """
 
+DOCUMENTINDEX_LLM_PROVIDER = "bedrock" # "azure" or "bedrock"
 
-async def basic_indexing_example():
+def create_llm_client_from_env():
+    """Build an LLM client based on environment configuration."""
+    provider = os.getenv("DOCUMENTINDEX_LLM_PROVIDER", DOCUMENTINDEX_LLM_PROVIDER).lower()
+    print(f"Using LLM provider: {provider}")
+    temperature_override = os.getenv("DOCUMENTINDEX_LLM_TEMPERATURE")
+    if temperature_override:
+        try:
+            temperature = float(temperature_override)
+        except ValueError as exc:
+            raise ValueError("DOCUMENTINDEX_LLM_TEMPERATURE must be a numeric value") from exc
+    else:
+        temperature = 0.0
+    if provider == "bedrock":
+        model = os.getenv("AWS_BEDROCK_MODEL_ID", "us.anthropic.claude-sonnet-4-5-20250929-v1:0")
+        print(f"Using model: {model}")
+        region = os.getenv("AWS_REGION", "us-east-1")
+        return create_bedrock_client(model=model, region=region, temperature=temperature)
+    if provider == "azure":
+        deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4.1")
+        print(f"Using deployment: {deployment}")
+        if not temperature_override and deployment.lower().startswith("gpt-5"):
+            temperature = 1.0  # Azure GPT-5 deployments require temperature=1
+        return create_azure_client(
+            deployment_name=deployment,
+            api_base=os.getenv("AZURE_OPENAI_API_BASE"),
+            api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15"),
+            api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+            temperature=temperature,
+        )
+    raise ValueError(
+        f"Unsupported DOCUMENTINDEX_LLM_PROVIDER '{provider}'. Expected 'bedrock' or 'azure'."
+    )
+
+
+async def basic_indexing_example(llm_client):
     """Example: Basic document indexing"""
     print("=" * 60)
     print("EXAMPLE 1: Basic Document Indexing")
     print("=" * 60)
     
-    # Create indexer with configuration
+    # Create indexer with Azure OpenAI configuration
     config = IndexerConfig(
-        llm_config=LLMConfig(model="gpt-4o", temperature=0.0),
+        llm_config=llm_client.config,
         generate_summaries=True,
     )
     indexer = DocumentIndexer(config)
@@ -131,17 +170,20 @@ async def basic_indexing_example():
         print(f"  [{node.node_id}] {node.title}")
         for child in node.children:
             print(f"    [{child.node_id}] {child.title}")
+
+    # print("\nDocument index")
+    # print(doc_index)
     
     return doc_index
 
 
-async def search_example(doc_index):
+async def search_example(doc_index, llm_client):
     """Example: Searching for related nodes"""
     print("\n" + "=" * 60)
     print("EXAMPLE 2: Node Search")
     print("=" * 60)
     
-    searcher = NodeSearcher(doc_index)
+    searcher = NodeSearcher(doc_index, llm_client=llm_client)
     
     # Search for nodes related to a topic
     query = "cybersecurity risks and data protection"
@@ -156,13 +198,13 @@ async def search_example(doc_index):
         print(f"    Reason: {match.match_reason[:100]}...")
 
 
-async def qa_example(doc_index):
+async def qa_example(doc_index, llm_client):
     """Example: Question Answering"""
     print("\n" + "=" * 60)
     print("EXAMPLE 3: Agentic Question Answering")
     print("=" * 60)
     
-    qa = AgenticQA(doc_index)
+    qa = AgenticQA(doc_index, llm_client=llm_client)
     
     # Ask a question
     question = "What was TechCorp's revenue in 2024 and how did it compare to the previous year?"
@@ -180,13 +222,13 @@ async def qa_example(doc_index):
             print(f"  - {citation.node_title}: {citation.excerpt[:100]}...")
 
 
-async def provenance_example(doc_index):
+async def provenance_example(doc_index, llm_client):
     """Example: Provenance Extraction"""
     print("\n" + "=" * 60)
     print("EXAMPLE 4: Provenance Extraction")
     print("=" * 60)
     
-    extractor = ProvenanceExtractor(doc_index)
+    extractor = ProvenanceExtractor(doc_index, llm_client=llm_client)
     
     # Extract all evidence about a topic
     topic = "climate change and environmental sustainability"
@@ -209,13 +251,13 @@ async def provenance_example(doc_index):
         print(f"\nSummary: {result.summary[:300]}...")
 
 
-async def multi_topic_example(doc_index):
+async def multi_topic_example(doc_index, llm_client):
     """Example: Multiple topic extraction"""
     print("\n" + "=" * 60)
     print("EXAMPLE 5: Multi-Topic Extraction")
     print("=" * 60)
     
-    extractor = ProvenanceExtractor(doc_index)
+    extractor = ProvenanceExtractor(doc_index, llm_client=llm_client)
     
     # Define multiple topics
     topics = {
@@ -243,12 +285,18 @@ async def main():
     print("DocumentIndex Usage Examples")
     print("#" * 60)
     
+    # Load environment variables from .env file
+    env_path = Path(__file__).parent.parent / '.env'
+    load_dotenv(env_path)
+    
+    llm_client = create_llm_client_from_env()
+    
     # Run examples
-    doc_index = await basic_indexing_example()
-    await search_example(doc_index)
-    await qa_example(doc_index)
-    await provenance_example(doc_index)
-    await multi_topic_example(doc_index)
+    doc_index = await basic_indexing_example(llm_client)
+    await search_example(doc_index, llm_client)
+    await qa_example(doc_index, llm_client)
+    await provenance_example(doc_index, llm_client)
+    await multi_topic_example(doc_index, llm_client)
     
     print("\n" + "=" * 60)
     print("Examples completed!")
