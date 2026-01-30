@@ -21,6 +21,7 @@ from documentindex import (
     create_azure_client,
     create_bedrock_client,
 )
+from typing import Optional
 
 # Sample 10-K document (abbreviated for example)
 SAMPLE_10K = """
@@ -139,12 +140,61 @@ def create_llm_client_from_env():
     )
 
 
-async def basic_indexing_example(llm_client):
-    """Example: Basic document indexing"""
+async def basic_indexing_example(llm_client, max_depth: Optional[int] = None):
+    """Example: Basic document indexing
+
+    Args:
+        llm_client: The LLM client to use
+        max_depth: Maximum depth to display in tree structure (None = show all)
+    """
     print("=" * 60)
     print("EXAMPLE 1: Basic Document Indexing")
     print("=" * 60)
-    
+
+    def print_tree_structure(nodes: list, max_depth: Optional[int] = None, current_depth: int = 0, indent: str = ""):
+        """Print tree structure with configurable depth.
+
+        Args:
+            nodes: List of nodes to print
+            max_depth: Maximum depth to display (None = show all)
+            current_depth: Current recursion depth
+            indent: Current indentation string
+        """
+        if not nodes:
+            if current_depth == 0:
+                print("  (No structure found)")
+            return
+
+        # Handle invalid depth values
+        if max_depth is not None and max_depth <= 0:
+            if current_depth == 0:
+                print("  (Depth set to 0, no nodes shown)")
+            return
+
+        for node in nodes:
+            # Handle very long titles
+            title = node.title
+            if len(title) > 80:
+                title = title[:77] + "..."
+
+            print(f"{indent}[{node.node_id}] {title}")
+
+            # Continue deeper if allowed
+            if max_depth is None or current_depth < max_depth - 1:
+                if node.children:
+                    print_tree_structure(
+                        node.children,
+                        max_depth,
+                        current_depth + 1,
+                        indent + "  "
+                    )
+            elif node.children and max_depth and current_depth == max_depth - 1:
+                # Show count of hidden children
+                child_count = len(node.children)
+                if child_count > 0:
+                    plural = "node" if child_count == 1 else "nodes"
+                    print(f"{indent}  ... ({child_count} child {plural} not shown)")
+
     # Create indexer with Azure OpenAI configuration
     config = IndexerConfig(
         llm_config=llm_client.config,
@@ -166,10 +216,11 @@ async def basic_indexing_example(llm_client):
     print(f"Total chunks: {len(doc_index.chunks)}")
     
     print("\nDocument Structure:")
-    for node in doc_index.structure:
-        print(f"  [{node.node_id}] {node.title}")
-        for child in node.children:
-            print(f"    [{child.node_id}] {child.title}")
+    print_tree_structure(doc_index.structure, max_depth)
+
+    # Add a note about the depth parameter when limited
+    if max_depth:
+        print(f"\n(Showing up to depth {max_depth}. Total nodes in document: {doc_index.get_node_count()})")
 
     # print("\nDocument index")
     # print(doc_index)
@@ -290,9 +341,18 @@ async def main():
     load_dotenv(env_path)
     
     llm_client = create_llm_client_from_env()
-    
+
+    # Optional: Get depth from environment
+    display_depth = None  # Default: show all levels
+    depth_env = os.getenv("DOCUMENTINDEX_DISPLAY_DEPTH")
+    if depth_env:
+        try:
+            display_depth = int(depth_env)
+        except ValueError:
+            print(f"Warning: Invalid DOCUMENTINDEX_DISPLAY_DEPTH '{depth_env}', using default")
+
     # Run examples
-    doc_index = await basic_indexing_example(llm_client)
+    doc_index = await basic_indexing_example(llm_client, max_depth=display_depth)
     await search_example(doc_index, llm_client)
     await qa_example(doc_index, llm_client)
     await provenance_example(doc_index, llm_client)
