@@ -307,10 +307,19 @@ DocumentIndex automatically detects document types:
 
 See the `examples/` directory for complete examples:
 
-- `basic_usage.py` - Getting started
-- `streaming_example.py` - Progress and streaming
-- `multi_provider_example.py` - Different LLM providers
-- `caching_example.py` - Cache configurations
+### Comprehensive Tutorials
+
+- **`indexer_deep_dive.py`** - DocumentIndexer deep dive with hierarchical tree visualization, metadata extraction, and cross-reference resolution
+- **`searcher_showcase.py`** - NodeSearcher showcase with relevance scoring, batch search, and cross-reference expansion
+- **`agentic_qa_tutorial.py`** - AgenticQA tutorial with reasoning traces, multi-hop questions, and confidence scoring
+- **`provenance_patterns.py`** - ProvenanceExtractor patterns with multi-category analysis, threshold tuning, and export formats
+
+### Quick Start Examples
+
+- **`basic_usage.py`** - Getting started with basic indexing and querying
+- **`streaming_example.py`** - Progress tracking and streaming responses
+- **`multi_provider_example.py`** - Using different LLM providers (OpenAI, Anthropic, Bedrock, Azure)
+- **`caching_example.py`** - Cache configurations (memory, file, Redis)
 
 ## Development
 
