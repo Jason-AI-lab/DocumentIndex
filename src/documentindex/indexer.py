@@ -145,20 +145,21 @@ class DocumentIndexer:
         if not doc_id:
             doc_id = str(uuid.uuid4())[:8]
         
-        # Step 1: Chunk text
-        reporter.report("Chunking", f"Processing {len(text)} characters")
-        chunks = self.chunker.chunk(text)
-        chunk_texts = [c.text for c in chunks]
-        chunk_offsets = [(c.start_char, c.end_char) for c in chunks]
-        
-        logger.info(f"Created {len(chunks)} chunks")
-        
-        # Step 2: Detect document type
+        # Step 1: Detect document type (must happen before chunking)
         reporter.report("Type Detection", "Analyzing document structure")
         if doc_type is None:
             doc_type = FinancialDocDetector.detect(text, doc_name)
-        
+
         logger.info(f"Detected document type: {doc_type.value}")
+
+        # Step 2: Chunk text (with type-specific section patterns)
+        reporter.report("Chunking", f"Processing {len(text)} characters")
+        self.chunker.set_doc_type(doc_type)
+        chunks = self.chunker.chunk(text)
+        chunk_texts = [c.text for c in chunks]
+        chunk_offsets = [(c.start_char, c.end_char) for c in chunks]
+
+        logger.info(f"Created {len(chunks)} chunks")
         
         # Step 3: Build structure
         reporter.report("Structure Building", f"Analyzing {len(chunks)} chunks")

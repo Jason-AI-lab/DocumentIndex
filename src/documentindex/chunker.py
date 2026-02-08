@@ -9,9 +9,12 @@ Splits text into chunks while respecting:
 """
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 import re
 import logging
+
+if TYPE_CHECKING:
+    from .models import DocumentType
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +115,30 @@ class TextChunker:
         self._compiled_patterns = [
             (re.compile(pattern, re.MULTILINE | re.IGNORECASE), level)
             for pattern, level in self.SEC_SECTION_PATTERNS
+        ]
+
+    def set_doc_type(self, doc_type: "DocumentType") -> None:
+        """Recompile section patterns using type-specific patterns from detector.
+
+        Merges the default SEC_SECTION_PATTERNS with any additional patterns
+        returned by ``FinancialDocDetector.get_section_patterns(doc_type)``.
+        """
+        from .detector import FinancialDocDetector
+
+        type_patterns = FinancialDocDetector.get_section_patterns(doc_type)
+
+        # Deduplicate: start with type-specific patterns, then add SEC
+        # patterns whose regex strings aren't already present.
+        seen_regexes = {p for p, _lvl in type_patterns}
+        merged = list(type_patterns)
+        for pattern, level in self.SEC_SECTION_PATTERNS:
+            if pattern not in seen_regexes:
+                merged.append((pattern, level))
+                seen_regexes.add(pattern)
+
+        self._compiled_patterns = [
+            (re.compile(pattern, re.MULTILINE | re.IGNORECASE), level)
+            for pattern, level in merged
         ]
     
     def chunk(self, text: str) -> list[Chunk]:

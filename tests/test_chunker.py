@@ -10,6 +10,7 @@ from documentindex.chunker import (
     TextChunker,
     count_tokens,
 )
+from documentindex.models import DocumentType
 
 
 class TestChunkConfig:
@@ -182,6 +183,101 @@ Subsection content.
 """
         chunks = chunker.chunk(text)
         assert len(chunks) >= 1
+
+
+class TestEarningsCallChunking:
+    """Tests for earnings call document chunking with speaker patterns."""
+
+    EARNINGS_CALL_TEXT = """## Q3 2024 Earnings Call Transcript
+
+**Operator:**
+
+Good morning and welcome to the Q3 2024 earnings conference call.
+I would now like to turn the call over to Jane Smith, Head of Investor Relations.
+
+**Jane Smith:**
+
+Thank you, operator. Good morning everyone and welcome to our third quarter
+2024 earnings call. Before we begin, I want to remind you that today's
+discussion will contain forward-looking statements.
+
+**John Doe:**
+
+Thanks Jane. We had an outstanding quarter with revenue of $15.2 billion,
+up 12% year over year. Operating margins expanded 150 basis points to 28.5%.
+Let me walk you through the key highlights.
+
+Our cloud segment grew 25% to $6.1 billion. Enterprise adoption accelerated
+with over 200 new large deals signed in the quarter.
+
+**Sarah Johnson:**
+
+Thank you, John. Turning to the financials in more detail. Total revenue was
+$15.2 billion, representing 12% growth. Gross margin was 65.3%, up from 63.8%
+in the prior year quarter. Operating expenses were well managed.
+
+Capital expenditures were $2.1 billion in the quarter, primarily directed toward
+data center expansion and AI infrastructure investments.
+
+Q&A Session
+
+**Analyst Mike Brown:**
+
+Great quarter. Can you talk about the CapEx outlook for 2025 and how much
+of that is directed toward AI infrastructure?
+
+**John Doe:**
+
+Sure Mike. We expect CapEx to be in the range of $9 to $10 billion for 2025,
+with approximately 60% directed toward AI and cloud infrastructure.
+"""
+
+    def test_markdown_bold_speaker_sections(self):
+        """set_doc_type(EARNINGS_CALL) should detect **Speaker:** boundaries."""
+        chunker = TextChunker()
+        chunker.set_doc_type(DocumentType.EARNINGS_CALL)
+        chunks = chunker.chunk(self.EARNINGS_CALL_TEXT)
+
+        section_titles = [c.section_title for c in chunks if c.section_title]
+        # Should detect multiple speaker sections
+        assert len(section_titles) >= 3, (
+            f"Expected >=3 speaker sections, got {len(section_titles)}: {section_titles}"
+        )
+
+    def test_default_chunker_misses_speakers(self):
+        """Without set_doc_type, the default SEC patterns should NOT detect speakers."""
+        chunker = TextChunker()
+        chunks = chunker.chunk(self.EARNINGS_CALL_TEXT)
+
+        # Default patterns will detect the markdown ## header but not **Speaker:** lines
+        bold_speaker_sections = [
+            c.section_title for c in chunks
+            if c.section_title and c.section_title.startswith("**")
+        ]
+        assert len(bold_speaker_sections) == 0
+
+    def test_earnings_call_produces_multiple_chunks(self):
+        """Earnings call text should produce multiple chunks when using small config."""
+        config = ChunkConfig(max_chunk_tokens=200)
+        chunker = TextChunker(config)
+        chunker.set_doc_type(DocumentType.EARNINGS_CALL)
+        chunks = chunker.chunk(self.EARNINGS_CALL_TEXT)
+
+        assert len(chunks) > 1, "Earnings call should produce multiple chunks"
+
+    def test_set_doc_type_preserves_sec_patterns(self):
+        """set_doc_type should merge type-specific patterns with SEC defaults."""
+        chunker = TextChunker()
+        chunker.set_doc_type(DocumentType.EARNINGS_CALL)
+
+        # The merged patterns should still detect SEC-style PART headers
+        text_with_part = "PART I\n\nSome content here.\n\n**Speaker Name:**\n\nMore content."
+        chunks = chunker.chunk(text_with_part)
+
+        section_titles = [c.section_title for c in chunks if c.section_title]
+        assert any("PART" in t for t in section_titles), (
+            f"SEC PART pattern should still work after set_doc_type: {section_titles}"
+        )
 
 
 class TestCountTokens:
