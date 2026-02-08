@@ -232,16 +232,18 @@ Sure Mike. We expect CapEx to be in the range of $9 to $10 billion for 2025,
 with approximately 60% directed toward AI and cloud infrastructure.
 """
 
-    def test_markdown_bold_speaker_sections(self):
-        """set_doc_type(EARNINGS_CALL) should detect **Speaker:** boundaries."""
+    def test_earnings_call_no_speaker_sections(self):
+        """set_doc_type(EARNINGS_CALL) should NOT produce per-speaker section titles."""
         chunker = TextChunker()
         chunker.set_doc_type(DocumentType.EARNINGS_CALL)
         chunks = chunker.chunk(self.EARNINGS_CALL_TEXT)
 
-        section_titles = [c.section_title for c in chunks if c.section_title]
-        # Should detect multiple speaker sections
-        assert len(section_titles) >= 3, (
-            f"Expected >=3 speaker sections, got {len(section_titles)}: {section_titles}"
+        bold_speaker_sections = [
+            c.section_title for c in chunks
+            if c.section_title and c.section_title.startswith("**")
+        ]
+        assert len(bold_speaker_sections) == 0, (
+            f"Expected no bold-speaker sections, got {bold_speaker_sections}"
         )
 
     def test_default_chunker_misses_speakers(self):
@@ -277,6 +279,42 @@ with approximately 60% directed toward AI and cloud infrastructure.
         section_titles = [c.section_title for c in chunks if c.section_title]
         assert any("PART" in t for t in section_titles), (
             f"SEC PART pattern should still work after set_doc_type: {section_titles}"
+        )
+
+    def test_earnings_call_size_based_chunking(self):
+        """A longer transcript should produce multiple size-based chunks."""
+        # Build a transcript large enough to exceed a single chunk
+        speakers = ["**CEO:**", "**CFO:**", "**Analyst 1:**", "**CEO:**", "**Analyst 2:**"]
+        long_text = "## Q4 2024 Earnings Call Transcript\n\n"
+        for speaker in speakers:
+            long_text += f"{speaker}\n\n"
+            # ~6000 chars per speaker turn ≈ 30K+ total
+            long_text += ("This quarter we saw strong performance across all segments. " * 60) + "\n\n"
+
+        config = ChunkConfig(max_chunk_tokens=2000, overlap_tokens=100)
+        chunker = TextChunker(config)
+        chunker.set_doc_type(DocumentType.EARNINGS_CALL)
+        chunks = chunker.chunk(long_text)
+
+        assert 3 <= len(chunks) <= 10, (
+            f"Expected 3-10 size-based chunks, got {len(chunks)}"
+        )
+
+    def test_earnings_call_explicit_qa_header_detected(self):
+        """A transcript with an explicit Q&A header should still split on it."""
+        text = (
+            "Operator\n\nWelcome to the call.\n\n"
+            "Prepared remarks content here. " * 20 + "\n\n"
+            "Q&A\n\n"
+            "Analyst questions and answers. " * 20 + "\n\n"
+        )
+        chunker = TextChunker()
+        chunker.set_doc_type(DocumentType.EARNINGS_CALL)
+        chunks = chunker.chunk(text)
+
+        section_titles = [c.section_title for c in chunks if c.section_title]
+        assert any("Q&A" in t or "Q & A" in t for t in section_titles), (
+            f"Expected Q&A section header to be detected: {section_titles}"
         )
 
 

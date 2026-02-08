@@ -215,12 +215,32 @@ class DocumentIndexer:
         """Build hierarchical structure using LLM"""
         if not chunks:
             return []
-        
+
         # Build chunk summary for structure detection
         chunks_summary = self._build_chunks_summary(chunks)
-        
-        # Get structure from LLM
-        prompt = f"""Analyze this document's structure and identify the hierarchical sections.
+
+        # Get type-specific prompt
+        if doc_type == DocumentType.EARNINGS_CALL:
+            prompt = self._earnings_call_structure_prompt(chunks_summary, len(chunks))
+        else:
+            prompt = self._generic_structure_prompt(chunks_summary, doc_type)
+
+        try:
+            result = await self.llm.complete_json(prompt)
+
+            if isinstance(result, list):
+                # Convert to TreeNodes
+                return self._build_tree_from_flat(result, chunks)
+            else:
+                logger.warning("LLM returned non-list structure, using fallback")
+                return self._build_fallback_structure(chunks)
+        except Exception as e:
+            logger.warning(f"Structure detection failed: {e}, using fallback")
+            return self._build_fallback_structure(chunks)
+
+    def _generic_structure_prompt(self, chunks_summary: str, doc_type: DocumentType) -> str:
+        """Build LLM prompt for generic document structure detection."""
+        return f"""Analyze this document's structure and identify the hierarchical sections.
 
 Document type: {doc_type.value}
 
@@ -243,22 +263,44 @@ Return a JSON array:
 ]
 
 Focus on major sections. For SEC filings, look for PART, ITEM, and major subsections.
-For earnings calls, look for Presentation, Q&A, and speaker sections.
 
 Return valid JSON array only."""
 
-        try:
-            result = await self.llm.complete_json(prompt)
-            
-            if isinstance(result, list):
-                # Convert to TreeNodes
-                return self._build_tree_from_flat(result, chunks)
-            else:
-                logger.warning("LLM returned non-list structure, using fallback")
-                return self._build_fallback_structure(chunks)
-        except Exception as e:
-            logger.warning(f"Structure detection failed: {e}, using fallback")
-            return self._build_fallback_structure(chunks)
+    def _earnings_call_structure_prompt(self, chunks_summary: str, num_chunks: int) -> str:
+        """Build LLM prompt for earnings call structure detection.
+
+        Produces 3-6 high-level sections (Opening, Prepared Remarks, Q&A, Closing)
+        rather than per-speaker nodes.
+        """
+        return f"""Analyze this earnings call transcript and identify 3 to 6 HIGH-LEVEL sections.
+
+The transcript has been split into {num_chunks} chunks. Here are the chunk markers and their starting content:
+
+{chunks_summary}
+
+Produce ONLY high-level phases of the call. Typical sections are:
+- Opening / Operator Introduction
+- Prepared Remarks (management presentations)
+- Q&A Session
+- Closing Remarks
+
+Do NOT create a separate node for each speaker turn. Group consecutive speaker turns
+into the phase they belong to.
+
+Coverage rules:
+- The first section must start at chunk_index 0.
+- The last section must end at end_chunk_index {num_chunks}.
+- Sections must not overlap and must not leave gaps between them.
+
+Return a JSON array with 3 to 6 objects:
+[
+  {{"structure": "1", "title": "Opening", "chunk_index": 0, "end_chunk_index": 2}},
+  {{"structure": "2", "title": "Prepared Remarks", "chunk_index": 2, "end_chunk_index": 5}},
+  {{"structure": "3", "title": "Q&A Session", "chunk_index": 5, "end_chunk_index": 7}},
+  {{"structure": "4", "title": "Closing Remarks", "chunk_index": 7, "end_chunk_index": 8}}
+]
+
+Return valid JSON array only."""
     
     def _build_chunks_summary(self, chunks: list[Chunk]) -> str:
         """Build summary of chunks for LLM"""

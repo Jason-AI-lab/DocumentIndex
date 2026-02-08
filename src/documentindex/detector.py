@@ -296,8 +296,6 @@ class FinancialDocDetector:
                 (r'^(?:OPERATOR|Operator)\s*$', 1),
                 (r'^(?:PRESENTATION|Presentation)\s*$', 1),
                 (r'^(?:Q\s*&\s*A|QUESTION\s+AND\s+ANSWER)', 1),
-                (r'^([A-Z][a-z]+\s+[A-Z][a-z]+)\s*[-–—]\s*', 2),  # Speaker: Name - Title
-                (r'^\*\*([^*]+)\*\*\s*:?\s*$', 2),                   # Speaker: **Name:**
                 *common_patterns,
             ]
         
