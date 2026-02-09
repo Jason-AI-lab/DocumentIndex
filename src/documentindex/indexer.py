@@ -40,19 +40,23 @@ class IndexerConfig:
     """Configuration for document indexer"""
     # LLM settings
     llm_config: Optional[LLMConfig] = None
-    
+
     # Chunking settings
     chunk_config: Optional[ChunkConfig] = None
-    
+
     # Feature flags
     generate_summaries: bool = True
     extract_metadata: bool = True
     resolve_cross_refs: bool = True
-    
+
     # Processing settings
     max_concurrent_summaries: int = 5
     large_section_threshold: int = 10  # Chunks - sections larger than this get recursively processed
-    
+
+    # Batch summary settings
+    summary_batch_size: int = 10  # Nodes per batch LLM call
+    max_concurrent_batches: int = 3  # Parallel batch processing limit
+
     # Cache
     use_cache: bool = True
 
@@ -473,34 +477,143 @@ Return valid JSON array only."""
         nodes: list[TreeNode],
         chunks: list[str],
     ) -> None:
-        """Generate summaries for all nodes"""
-        all_nodes = []
+        """Generate summaries for all nodes using batched LLM calls with fallback"""
+        try:
+            await self._generate_summaries_batched(nodes, chunks)
+        except Exception as e:
+            logger.warning(f"Batched summary generation failed: {e}, falling back to individual calls")
+            await self._generate_summaries_individual(nodes, chunks)
+
+    async def _generate_summaries_batched(
+        self,
+        nodes: list[TreeNode],
+        chunks: list[str],
+    ) -> None:
+        """Generate summaries using batched LLM calls (more efficient)"""
+        all_nodes: list[TreeNode] = []
         self._collect_all_nodes(nodes, all_nodes)
-        
+
+        # Filter to only nodes with substantial content
+        nodes_to_summarize = []
+        for node in all_nodes:
+            text = "\n".join(chunks[node.start_index:node.end_index])
+            if len(text) > 100:
+                nodes_to_summarize.append(node)
+
+        if not nodes_to_summarize:
+            return
+
+        # Create batches
+        batch_size = self.config.summary_batch_size
+        batches = [
+            nodes_to_summarize[i:i + batch_size]
+            for i in range(0, len(nodes_to_summarize), batch_size)
+        ]
+
+        logger.info(f"Generating summaries for {len(nodes_to_summarize)} nodes in {len(batches)} batches")
+
+        # Process batches with concurrency limit
+        semaphore = asyncio.Semaphore(self.config.max_concurrent_batches)
+
+        async def process_batch(batch: list[TreeNode]) -> dict[str, str]:
+            async with semaphore:
+                return await self._generate_batch_summaries(batch, chunks)
+
+        results = await asyncio.gather(*[process_batch(b) for b in batches], return_exceptions=True)
+
+        # Apply summaries to nodes
+        for result in results:
+            if isinstance(result, Exception):
+                logger.warning(f"Batch failed: {result}")
+                continue
+            for node_id, summary in result.items():
+                node = self._find_node_by_id(all_nodes, node_id)
+                if node:
+                    node.summary = summary
+
+    async def _generate_batch_summaries(
+        self,
+        batch: list[TreeNode],
+        chunks: list[str],
+    ) -> dict[str, str]:
+        """Generate summaries for a batch of nodes in a single LLM call"""
+        if not batch:
+            return {}
+
+        # Build batch prompt with section contents
+        sections_text = []
+        for node in batch:
+            text = "\n".join(chunks[node.start_index:node.end_index])
+            text = self._sample_text(text, max_chars=2000)
+            sections_text.append(f"[{node.node_id}] {node.title}:\n{text}")
+
+        prompt = f"""Summarize each of the following document sections in 2-3 sentences each.
+Focus on the key information and main points.
+
+Sections:
+{"---".join(sections_text)}
+
+Return a JSON array with summaries for each section:
+[
+  {{"node_id": "0001", "summary": "2-3 sentence summary..."}},
+  {{"node_id": "0002", "summary": "2-3 sentence summary..."}}
+]
+
+Provide summaries for ALL {len(batch)} sections. Return valid JSON array only."""
+
+        try:
+            results = await self._cached_llm_complete_json(prompt)
+            if not isinstance(results, list):
+                logger.warning("Batch summary returned non-list, returning empty")
+                return {}
+
+            return {
+                r["node_id"]: str(r.get("summary", ""))[:500]
+                for r in results
+                if isinstance(r, dict) and "node_id" in r
+            }
+        except Exception as e:
+            logger.warning(f"Batch summary generation failed: {e}")
+            return {}
+
+    async def _generate_summaries_individual(
+        self,
+        nodes: list[TreeNode],
+        chunks: list[str],
+    ) -> None:
+        """Generate summaries individually (fallback method)"""
+        all_nodes: list[TreeNode] = []
+        self._collect_all_nodes(nodes, all_nodes)
+
         # Generate summaries concurrently with limit
         semaphore = asyncio.Semaphore(self.config.max_concurrent_summaries)
-        
+
         async def summarize_node(node: TreeNode):
             async with semaphore:
                 text = "\n".join(chunks[node.start_index:node.end_index])
                 if len(text) > 100:  # Only summarize substantial content
                     node.summary = await self._generate_summary(text, node.title)
-        
+
         await asyncio.gather(*[summarize_node(n) for n in all_nodes])
-    
+
     def _collect_all_nodes(self, nodes: list[TreeNode], result: list[TreeNode]):
         """Collect all nodes recursively"""
         for node in nodes:
             result.append(node)
             if node.children:
                 self._collect_all_nodes(node.children, result)
-    
+
+    def _find_node_by_id(self, nodes: list[TreeNode], node_id: str) -> TreeNode | None:
+        """Find a node by its ID in a flat list"""
+        for node in nodes:
+            if node.node_id == node_id:
+                return node
+        return None
+
     async def _generate_summary(self, text: str, title: str) -> str:
-        """Generate summary for a section"""
-        # Truncate text if too long
-        if len(text) > 6000:
-            text = text[:3000] + "\n...[truncated]...\n" + text[-3000:]
-        
+        """Generate summary for a single section"""
+        text = self._sample_text(text, max_chars=6000)
+
         prompt = f"""Summarize this document section in 2-3 sentences.
 
 Section: {title}
@@ -511,11 +624,77 @@ Content:
 Provide a concise summary focusing on the key information:"""
 
         try:
-            summary = await self.llm.complete(prompt)
+            summary = await self._cached_llm_complete(prompt)
             return summary.strip()[:500]  # Limit summary length
         except Exception as e:
             logger.warning(f"Summary generation failed for {title}: {e}")
             return ""
+
+    def _sample_text(self, text: str, max_chars: int = 6000) -> str:
+        """Intelligently sample text for summarization with sentence boundaries"""
+        if len(text) <= max_chars:
+            return text
+
+        # Calculate space for head and tail
+        half = (max_chars - 30) // 2  # Reserve space for truncation marker
+
+        # Find sentence boundary for head
+        head = text[:half + 200]
+        sentence_end = max(
+            head.rfind('. '),
+            head.rfind('? '),
+            head.rfind('! '),
+        )
+        if sentence_end > half // 2:
+            head = head[:sentence_end + 1]
+        else:
+            head = text[:half]
+
+        # Find sentence boundary for tail
+        tail_start = len(text) - half - 200
+        if tail_start < 0:
+            tail_start = 0
+        tail = text[tail_start:]
+        sentence_start = tail.find('. ')
+        if sentence_start > 0 and sentence_start < 400:
+            tail = tail[sentence_start + 2:]
+        else:
+            tail = text[-half:]
+
+        return head.strip() + "\n\n...[content truncated]...\n\n" + tail.strip()
+
+    async def _cached_llm_complete(self, prompt: str) -> str:
+        """LLM completion with optional caching"""
+        if self.config.use_cache and self.cache:
+            model = self.llm.config.model
+            cached = await self.cache.get_llm_response(prompt, model)
+            if cached is not None:
+                logger.debug("Cache hit for LLM prompt")
+                return cached
+
+        response = await self.llm.complete(prompt)
+
+        if self.config.use_cache and self.cache:
+            await self.cache.set_llm_response(prompt, self.llm.config.model, response)
+
+        return response
+
+    async def _cached_llm_complete_json(self, prompt: str) -> Any:
+        """JSON LLM completion with optional caching"""
+        if self.config.use_cache and self.cache:
+            model = self.llm.config.model
+            cached = await self.cache.get_llm_response(prompt, model)
+            if cached is not None:
+                logger.debug("Cache hit for LLM JSON prompt")
+                # Parse cached string as JSON
+                return self.llm._extract_json(cached)
+
+        response = await self.llm.complete(prompt, response_format="json")
+
+        if self.config.use_cache and self.cache:
+            await self.cache.set_llm_response(prompt, self.llm.config.model, response)
+
+        return self.llm._extract_json(response)
 
 
 # ============================================================================
