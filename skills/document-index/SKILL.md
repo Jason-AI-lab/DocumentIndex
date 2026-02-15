@@ -66,9 +66,9 @@ Use DocumentIndex patterns when you need to:
 ## Configuration Trade-offs
 
 ### Speed vs. Quality
-- **Fast/Cheap**: Lower thresholds, fewer iterations, no summaries
-- **Balanced**: Default configurations (recommended for most use cases)
-- **Thorough**: Higher thresholds, more iterations, with summaries
+- **Fast/Cheap**: Lower thresholds, fewer iterations, no summaries, multi-model routing
+- **Balanced**: Default configurations with multi-model (recommended for most use cases)
+- **Thorough**: Higher thresholds, more iterations, with summaries, full excerpt extraction
 
 ### Coverage vs. Precision
 - **Maximum coverage**: Low relevance thresholds (0.5-0.6)
@@ -115,10 +115,10 @@ DocumentIndexer → AgenticQA (quick questions)
 
 | Component | Time | Cost | Use Case |
 |-----------|------|------|----------|
-| Document Indexing | 30-60s | $0.10-0.50 | One-time per document |
-| Node Searching | 2-5s | $0.01-0.05 | Per search query |
+| Document Indexing | 30-60s | $0.05-0.25 | One-time per document (multi-model) |
+| Node Searching | 2-5s | $0.01-0.05 | Per search query (with LLM caching) |
 | Agentic QA | 5-15s | $0.02-0.10 | Per question |
-| Provenance Extraction | 30-90s | $0.05-0.20 | Per topic extraction |
+| Provenance Extraction | 30-90s | $0.05-0.20 | Per topic (multi-model + batching) |
 
 ## Additional Resources
 

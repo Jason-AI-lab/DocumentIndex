@@ -9,7 +9,7 @@ Systematically evaluate every node in a document tree against one or more topics
 ## API Pattern
 
 ```python
-from documentindex import ProvenanceExtractor, ProvenanceConfig
+from documentindex import ProvenanceExtractor, ProvenanceConfig, LLMConfig
 
 # Basic usage
 extractor = ProvenanceExtractor(doc_index, llm_client=llm_client)
@@ -19,24 +19,43 @@ print(f"Found {len(result.evidence)} relevant sections")
 print(f"Scanned {result.total_nodes_scanned} nodes")
 print(f"Coverage: {result.scan_coverage:.0%}")
 
-# With configuration
+# With multi-model support (cheap model for scoring, capable for excerpts)
+extractor = ProvenanceExtractor(
+    doc_index,
+    llm_config=LLMConfig(model="gpt-4o"),              # Excerpt extraction
+    scoring_llm_config=LLMConfig(model="gpt-4o-mini"),  # Scoring + summary
+    cache_manager=cache,                                 # LLM response caching
+)
+
+# With full configuration
 config = ProvenanceConfig(
     relevance_threshold=0.6,        # Min score to include
     extract_excerpts=True,          # Extract relevant excerpts
-    max_excerpts_per_node=3,        # Max excerpts per node
+    max_excerpts_per_node=5,        # Max excerpts per node
     generate_summary=True,          # Generate summary of findings
-    parallel_workers=3,             # Concurrent LLM calls
-    batch_size=10                   # Nodes per batch
+    parallel_workers=5,             # Concurrent batch processing
+    batch_size=10,                  # Nodes per scoring batch
+    excerpt_threshold=0.75,         # Only extract excerpts for high-confidence matches
+    excerpt_token_budget=30000,     # Max input tokens per excerpt batch
+    max_concurrent_categories=3,    # Parallel category extractions
 )
 result = await extractor.extract_all("ESG initiatives", config)
 
-# Multi-category extraction
+# Multi-category extraction (scoring cache shared across topics)
 categories = {
     "climate": "climate change and environmental risks",
     "cyber": "cybersecurity and data protection",
     "regulatory": "regulatory compliance requirements"
 }
 results = await extractor.extract_by_category(categories)
+
+# Convenience function with multi-model
+from documentindex import extract_provenance
+result = await extract_provenance(
+    doc_index, "climate risks",
+    model="gpt-4o",
+    scoring_model="gpt-4o-mini",
+)
 
 # Progress tracking
 def on_progress(update):
@@ -55,29 +74,42 @@ async for match in extractor.extract_stream("financial risks"):
 ## Key Features
 
 ### 1. Exhaustive Scanning
+
 - Evaluates 100% of nodes in document tree
 - Guarantees no relevant content is missed
 - Reports scan coverage statistics
 
-### 2. Multi-Category Analysis
+### 2. Multi-Model Routing
+
+- Cheap model (e.g., gpt-4o-mini) for node scoring and summary generation
+- Capable model (e.g., gpt-4o) for excerpt extraction (requires reading comprehension)
+- Configure via `scoring_llm_config` parameter
+- Reduces costs by 50%+ without quality loss
+
+### 3. Multi-Category Analysis
+
 - Extract evidence for multiple topics concurrently
-- Identifies overlap between categories
-- Efficient parallel processing
+- Scoring cache shared across topics (score once, reuse)
+- Configurable concurrency via `max_concurrent_categories`
 
-### 3. Evidence Scoring
+### 4. Evidence Scoring
+
 - Each match scored 0.0-1.0 for relevance
+- Scoring delegated to NodeSearcher (shared, cached logic)
 - Configurable threshold for inclusion
-- Helps prioritize most relevant sections
 
-### 4. Excerpt Extraction
-- Extracts relevant text passages from each node
-- Configurable number of excerpts per node
-- Useful for quick review without full text
+### 5. Excerpt Extraction
 
-### 5. Summary Generation
+- Uses full node content (no head+tail truncation)
+- Token-aware batching: multiple nodes grouped into single LLM calls by token budget
+- Excerpt threshold: only high-confidence matches (score >= `excerpt_threshold`) get excerpts
+- Lower-scoring matches still appear in results but without excerpts
+
+### 6. Summary Generation
+
 - Optional LLM-generated summary of all findings
+- Uses scoring LLM (cheap model) since input is pre-structured
 - Synthesizes evidence across all matches
-- Useful for executive reports
 
 ### 6. Progress Tracking
 - Real-time updates during long operations
@@ -98,7 +130,10 @@ async for match in extractor.extract_stream("financial risks"):
 | `max_excerpts_per_node` | int | 3 | Max excerpts per match |
 | `generate_summary` | bool | False | Generate findings summary |
 | `parallel_workers` | int | 3 | Concurrent LLM calls |
-| `batch_size` | int | 10 | Nodes to process per batch |
+| `batch_size` | int | 10 | Nodes per scoring batch |
+| `excerpt_threshold` | float | 0.75 | Min score for excerpt extraction |
+| `excerpt_token_budget` | int | 30000 | Max input tokens per excerpt batch |
+| `max_concurrent_categories` | int | 3 | Parallel category extractions |
 
 ## Output Structure
 
@@ -194,16 +229,25 @@ result = await extractor.extract_with_progress(
 
 1. **Use appropriate threshold**: 0.5-0.6 for broad coverage, 0.7+ for precision
 2. **Enable excerpts**: Makes review much faster than reading full text
-3. **Use multi-category for related topics**: More efficient than separate calls
-4. **Generate summaries for reports**: Saves manual synthesis time
-5. **Track progress for large docs**: Provides visibility into long operations
+3. **Use multi-model for cost savings**: Set `scoring_llm_config` to a cheaper model (e.g., gpt-4o-mini) for scoring and summary; keep capable model for excerpts
+4. **Use multi-category for related topics**: Scoring cache shared across topics for efficiency
+5. **Enable caching**: Pass `cache_manager` to avoid redundant LLM calls on repeated extractions
+6. **Use excerpt threshold**: Set `excerpt_threshold=0.75` to skip excerpt extraction for marginally relevant matches (saves 30-50% on excerpt costs)
+7. **Generate summaries for reports**: Uses scoring LLM (cheap model) since input is pre-structured
+8. **Track progress for large docs**: Provides visibility into long operations
 
 ## Performance Considerations
 
 - **Extraction time**: ~30-90 seconds for typical 30-40 node document
-- **API costs**: ~$0.05-0.20 per extraction depending on document size
+- **API costs**: ~$0.05-0.20 per extraction with multi-model (50%+ savings vs single model)
 - **Memory usage**: Minimal with streaming, moderate with full results
+- **LLM caching**: Individual scoring calls cached, so repeated/overlapping extractions avoid redundant LLM calls
+- **Token-aware batching**: Multiple nodes grouped into single excerpt calls by token budget, reducing API round-trips by 50-75%
+- **Full content**: No head+tail truncation — complete node text sent for excerpt extraction, eliminating content loss
 - **Recommended settings**:
+  - `scoring_llm_config=LLMConfig(model="gpt-4o-mini")` (cost optimization)
+  - `excerpt_threshold=0.75` (skip excerpts for marginal matches)
+  - `excerpt_token_budget=30000` (optimal batch size for excerpt calls)
   - Small docs (<20 nodes): `parallel_workers=5`, `batch_size=15`
   - Medium docs (20-50 nodes): `parallel_workers=3`, `batch_size=10` (default)
   - Large docs (>50 nodes): `parallel_workers=2`, `batch_size=8`, use streaming

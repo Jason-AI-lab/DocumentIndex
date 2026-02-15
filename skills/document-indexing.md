@@ -9,7 +9,7 @@ Transform unstructured text into a navigable tree index with automatic structure
 ## API Pattern
 
 ```python
-from documentindex import DocumentIndexer, IndexerConfig, ChunkConfig
+from documentindex import DocumentIndexer, IndexerConfig, ChunkConfig, LLMConfig
 
 # Basic usage
 indexer = DocumentIndexer()
@@ -18,29 +18,46 @@ doc_index = await indexer.index(
     doc_name="AAPL_10K_2024"
 )
 
-# With configuration
+# With configuration (including multi-model support)
 config = IndexerConfig(
-    llm_config=llm_client.config,
+    llm_config=LLMConfig(model="gpt-4o"),              # Structure detection
+    summary_llm_config=LLMConfig(model="gpt-4o-mini"),  # Cheaper model for summaries
     chunk_config=ChunkConfig(max_chunk_tokens=1000),
     generate_summaries=True,      # Generate node summaries
     extract_metadata=True,         # Extract entities, dates, numbers
     resolve_cross_refs=True,       # Resolve "See Note 15" references
-    max_concurrent_summaries=5     # Parallel processing limit
+    max_concurrent_summaries=5,    # Parallel processing limit
+    summary_batch_size=10,         # Nodes per batched summary call
+    summary_token_budget=8000,     # Max input tokens per summary batch
 )
 indexer = DocumentIndexer(config)
 doc_index = await indexer.index(text=document_text, doc_name="doc_name")
+
+# Convenience function with multi-model
+from documentindex import index_document
+doc_index = await index_document(
+    text=document_text,
+    doc_name="doc_name",
+    model="gpt-4o",
+    summary_model="gpt-4o-mini",
+)
 ```
 
 ## Key Features
 
 ### 1. Automatic Structure Detection
+
 - Detects document type (10-K, 10-Q, 8-K, earnings calls, etc.)
 - Identifies hierarchical structure (PART → ITEM → Section → Note)
+- Skips LLM when chunk metadata has clear section headers (LLM-skip optimization)
 - Creates tree nodes with parent-child relationships
 
 ### 2. Node Summarization
-- Generates concise summaries for each node using LLM
-- Helps with navigation and search
+
+- Generates concise summaries using token-aware batched LLM calls
+- Leaf nodes summarized from raw text, parent nodes synthesized from children (bottom-up)
+- Supports separate cheaper LLM model via `summary_llm_config`
+- Small documents use a combined structure+summary call for efficiency
 - Configurable via `generate_summaries=True`
 
 ### 3. Metadata Extraction
@@ -57,12 +74,18 @@ doc_index = await indexer.index(text=document_text, doc_name="doc_name")
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `llm_config` | LLMConfig | Required | LLM provider configuration |
+| `llm_config` | LLMConfig | Required | LLM for structure detection |
+| `summary_llm_config` | LLMConfig | None | Cheaper LLM for summaries (defaults to llm_config) |
 | `chunk_config` | ChunkConfig | Default | Chunking parameters |
 | `generate_summaries` | bool | True | Generate node summaries |
-| `extract_metadata` | bool | False | Extract structured metadata |
+| `extract_metadata` | bool | True | Extract structured metadata |
 | `resolve_cross_refs` | bool | True | Resolve cross-references |
-| `max_concurrent_summaries` | int | 3 | Parallel summary generation limit |
+| `max_concurrent_summaries` | int | 5 | Parallel summary generation limit |
+| `summary_batch_size` | int | 10 | Nodes per batched summary call |
+| `summary_token_budget` | int | 8000 | Max input tokens per summary batch |
+| `max_concurrent_batches` | int | 3 | Parallel batch processing limit |
+| `small_doc_threshold` | int | 15 | Chunks - docs smaller use combined structure+summary |
+| `use_cache` | bool | True | Cache LLM responses |
 
 ## Output Structure
 
@@ -127,20 +150,24 @@ config = IndexerConfig(
 ## Best Practices
 
 1. **Enable summaries for navigation**: Summaries dramatically improve search relevance
-2. **Use metadata extraction for structured queries**: Enables finding specific dates, numbers, entities
-3. **Resolve cross-references for comprehensive retrieval**: Critical for following document links
-4. **Adjust concurrency based on rate limits**: Higher concurrency = faster but may hit API limits
-5. **Consider chunking strategy**: Larger chunks = fewer API calls but less granular retrieval
+2. **Use multi-model for cost savings**: Set `summary_llm_config` to a cheaper model (e.g., gpt-4o-mini) for summaries
+3. **Use metadata extraction for structured queries**: Enables finding specific dates, numbers, entities
+4. **Resolve cross-references for comprehensive retrieval**: Critical for following document links
+5. **Adjust concurrency based on rate limits**: Higher concurrency = faster but may hit API limits
+6. **Enable caching**: LLM response caching avoids redundant calls on re-indexing
 
 ## Performance Considerations
 
 - **Indexing time**: ~30-60 seconds for typical 10-K (50-100 pages) with summaries
-- **API costs**: ~$0.10-0.50 per document depending on size and configuration
+- **API costs**: ~$0.05-0.25 per document with multi-model (cheap summary model saves 50%+)
+- **LLM-skip**: Well-sectioned documents (e.g., SEC filings) skip LLM structure detection entirely
 - **Memory usage**: ~10-50MB per indexed document in memory
 - **Recommended settings for production**:
   - `generate_summaries=True` (critical for search quality)
+  - `summary_llm_config=LLMConfig(model="gpt-4o-mini")` (cost optimization)
   - `max_concurrent_summaries=5` (balance speed and rate limits)
-  - `chunk_config=ChunkConfig(max_chunk_tokens=1000)` (standard size)
+  - `summary_token_budget=8000` (optimal batch size for summary calls)
+  - `use_cache=True` (essential for re-indexing performance)
 
 ## Example Output
 

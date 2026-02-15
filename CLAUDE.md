@@ -41,26 +41,28 @@ ruff check src tests
 
 The system is built around a hierarchical tree indexing approach:
 
-1. **DocumentIndexer** (`src/documentindex/indexer.py`): Builds a hierarchical tree from documents, understanding structure like PART/ITEM/Note hierarchies in financial documents.
+1. **DocumentIndexer** (`src/documentindex/indexer.py`): Builds a hierarchical tree from documents. Supports multi-model (separate summary LLM), LLM-skip for well-sectioned documents, token-aware batched summaries with bottom-up parent synthesis, and combined structure+summary calls for small documents.
 
 2. **AgenticQA** (`src/documentindex/agentic_qa.py`): Implements iterative question-answering by reasoning through the document tree, following cross-references, and building confidence in answers.
 
-3. **ProvenanceExtractor** (`src/documentindex/provenance.py`): Performs exhaustive searches across the entire document tree to find all evidence related to specified topics.
+3. **ProvenanceExtractor** (`src/documentindex/provenance.py`): Exhaustive evidence extraction with multi-model support (cheap model for scoring/summary, capable model for excerpts), token-aware batched excerpt extraction using full node content, excerpt threshold filtering, and LLM response caching.
 
-4. **NodeSearcher** (`src/documentindex/search.py`): Core search functionality that uses LLM reasoning to find relevant nodes based on queries.
+4. **NodeSearcher** (`src/documentindex/searcher.py`): Core search functionality with LLM-level response caching, configurable concurrency, and batched cross-reference scoring.
 
 ### Key Design Patterns
 
 - **Async-First**: All core operations are async using `asyncio`
 - **LLM Provider Abstraction**: Uses `litellm` for multi-provider support (OpenAI, Anthropic, Bedrock, Azure, Ollama)
+- **Multi-Model Routing**: Separate LLM configs for different task types (e.g., cheap model for scoring/summaries, capable model for structure detection and excerpt extraction)
 - **Streaming Support**: Built-in streaming for real-time progress and responses
-- **Caching Strategy**: Three-tier caching (memory, file, Redis) with consistent interface
+- **Caching Strategy**: Three-tier caching (memory, file, Redis) with LLM-level response caching across indexer, searcher, and provenance
+- **Token-Aware Batching**: Intelligent grouping of LLM calls by estimated token budget to minimize API round-trips
 
 ### Data Flow
 
-1. **Indexing**: Raw text → Document detection → Chunking → Tree building → Node summaries
+1. **Indexing**: Raw text → Document detection → Chunking → Structure detection (LLM or chunk metadata skip) → Batched summaries (leaf nodes from text, parents synthesized from children) → Metadata + cross-refs in parallel
 2. **QA**: Question → Initial search → Follow cross-refs → Build answer → Confidence scoring
-3. **Provenance**: Topic → Parallel node evaluation → Evidence collection → Categorization
+3. **Provenance**: Topic → Batched node scoring (cached) → Token-aware batched excerpt extraction (full node content, no truncation) → Summary generation
 
 ## Testing Approach
 
@@ -83,9 +85,10 @@ Extracts structured information (company names, dates, financial figures) during
 ### Configuration System
 Extensive configuration options through dataclasses:
 - `LLMConfig`: Provider settings and model selection
-- `IndexerConfig`: Indexing behavior
+- `IndexerConfig`: Indexing behavior (includes `summary_llm_config` for multi-model, `summary_token_budget`, `summary_batch_size`, `small_doc_threshold`)
 - `AgenticQAConfig`: QA iterations and confidence thresholds
-- `ProvenanceConfig`: Evidence extraction settings
+- `ProvenanceConfig`: Evidence extraction settings (includes `scoring_llm_config` for multi-model, `excerpt_threshold`, `excerpt_token_budget`, `max_concurrent_categories`)
+- `NodeSearchConfig`: Search behavior (includes `batch_size`, `max_concurrent_batches`)
 - `CacheConfig`: Cache backend selection
 
 ## Common Development Tasks

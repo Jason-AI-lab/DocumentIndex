@@ -13,11 +13,12 @@ This directory contains skill documents that summarize the core capabilities of 
 **Core Capability**: Transform unstructured text into hierarchical tree structures with summaries, metadata, and cross-references.
 
 **Key Topics**:
-- Automatic structure detection (SEC filings, earnings calls, reports)
-- Node summarization for navigation
+- Automatic structure detection with LLM-skip for well-sectioned documents
+- Node summarization with token-aware batching and multi-model support
 - Metadata extraction (dates, numbers, entities)
 - Cross-reference resolution ("See Note 15")
-- Performance tuning and chunking strategies
+- Multi-model routing (cheap model for summaries, capable for structure)
+- LLM response caching and performance tuning
 
 **Use When**: You need to index a new document for querying
 
@@ -28,10 +29,10 @@ This directory contains skill documents that summarize the core capabilities of 
 
 **Key Topics**:
 - Relevance scoring (0.0-1.0) with reasoning
-- Cross-reference expansion
-- Batch processing optimization
+- Cross-reference expansion with batched scoring
+- Batch processing with configurable concurrency
+- LLM-level response caching (shared across components)
 - Threshold tuning for precision/recall
-- Caching strategies
 
 **Use When**: You need to find sections related to a query
 
@@ -57,12 +58,13 @@ This directory contains skill documents that summarize the core capabilities of 
 
 **Key Topics**:
 - 100% document coverage guarantee
-- Multi-category parallel extraction
-- Evidence scoring and ranking
-- Summary generation from findings
-- Progress tracking for long operations
+- Multi-model routing (cheap scoring, capable excerpts)
+- Token-aware batched excerpt extraction with full content
+- Multi-category parallel extraction with scoring cache
+- Excerpt threshold for cost optimization
+- LLM response caching across extractions
+- Summary generation, progress tracking, streaming results
 - Export formats (JSON, CSV, Markdown)
-- Streaming results
 
 **Use When**: You need comprehensive evidence for compliance, audits, or research
 

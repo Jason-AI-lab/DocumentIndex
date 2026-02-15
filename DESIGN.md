@@ -1575,11 +1575,18 @@ class NodeSearchConfig:
     include_children: bool = True  # Include children of matching nodes
     follow_cross_refs: bool = True  # Follow cross-references
     use_cache: bool = True
+    batch_size: int = 10  # Nodes to score per LLM call
+    max_concurrent_batches: int = 3  # Parallel batch processing limit
 
 
 class NodeSearcher:
     """
     Searches document tree for nodes related to a query.
+
+    Features:
+    - LLM-level response caching (via _cached_llm_complete_json)
+    - Configurable concurrency for batch scoring
+    - Batched cross-reference scoring (all refs in one call)
     
     Returns all matching nodes with:
     - Relevance scores
@@ -2142,26 +2149,55 @@ class ProvenanceConfig:
     max_excerpts_per_node: int = 5
     generate_summary: bool = True
     parallel_workers: int = 5
+    batch_size: int = 10  # Nodes per LLM batch
+
+    # Excerpt extraction optimization
+    excerpt_threshold: float = 0.75  # Only extract excerpts for high-confidence matches
+    excerpt_token_budget: int = 30000  # Max input tokens per excerpt batch
+
+    # Multi-model support
+    scoring_llm_config: Optional[LLMConfig] = None  # Cheaper model for scoring + summary
+
+    # Concurrency
+    max_concurrent_categories: int = 3  # Parallel category extractions
 
 
 class ProvenanceExtractor:
     """
-    Exhaustive provenance extraction.
-    
+    Exhaustive provenance extraction from documents.
+
     Scans ALL nodes in the document to find every piece of
     evidence related to a topic.
+
+    Optimizations:
+    - Multi-model: cheap model for scoring + summary, capable model for excerpts
+    - Token-aware batched excerpt extraction using full node content (no truncation)
+    - Excerpt threshold: only extract excerpts for high-confidence matches
+    - LLM response caching across all call sites
+    - Scoring delegated to NodeSearcher (no duplicated code)
     """
-    
+
     def __init__(
         self,
         doc_index: DocumentIndex,
-        llm_config: LLMConfig = None,
+        llm_client: Optional[LLMClient] = None,
+        llm_config: Optional[LLMConfig] = None,
         cache_manager: CacheManager = None,
+        scoring_llm_config: Optional[LLMConfig] = None,
     ):
         self.doc_index = doc_index
-        self.llm = LLMClient(llm_config or LLMConfig())
+        self.llm = llm_client or LLMClient(llm_config or LLMConfig())
+        self.scoring_llm = (
+            LLMClient(scoring_llm_config)
+            if scoring_llm_config
+            else self.llm
+        )
         self.cache = cache_manager
-        self.searcher = NodeSearcher(doc_index, llm_config, cache_manager)
+        self.searcher = NodeSearcher(
+            doc_index,
+            llm_client=self.scoring_llm,
+            cache_manager=cache_manager,
+        )
     
     async def extract_all(
         self,
@@ -2236,48 +2272,37 @@ class ProvenanceExtractor:
         
         return dict(zip(tasks.keys(), results))
     
-    async def _extract_excerpts(
+    async def _extract_excerpts_batched(
         self,
         matches: list[NodeMatch],
         topic: str,
         config: ProvenanceConfig,
     ) -> None:
-        """Extract specific relevant excerpts from each match"""
-        
+        """Extract excerpts using token-aware batching with full node content.
+
+        Only extracts excerpts for matches above excerpt_threshold.
+        Groups nodes into batches respecting excerpt_token_budget.
+        Uses full node text (no head+tail truncation).
+        """
+        # Filter to high-confidence matches only
+        excerpt_matches = [
+            m for m in matches
+            if m.relevance_score >= config.excerpt_threshold
+        ]
+
+        if not excerpt_matches:
+            return
+
+        # Create token-aware batches
+        batches = self._create_excerpt_batches(excerpt_matches, config)
+
         semaphore = asyncio.Semaphore(config.parallel_workers)
-        
-        async def extract_for_node(match: NodeMatch):
+
+        async def process_batch(batch):
             async with semaphore:
-                text = self.doc_index.get_node_text(match.node.node_id)
-                if not text:
-                    return
-                
-                prompt = f"""Extract the specific text excerpts from this section that are relevant to the topic.
+                await self._extract_excerpts_batch(batch, topic, config)
 
-Topic: {topic}
-
-Section: {match.node.title}
-Section Text:
-{text[:8000]}
-
-Find up to {config.max_excerpts_per_node} distinct excerpts that contain evidence related to the topic.
-Quote the exact text.
-
-Return JSON:
-{{
-  "excerpts": [
-    "exact quote 1...",
-    "exact quote 2..."
-  ]
-}}"""
-
-                try:
-                    result = await self.llm.complete_json(prompt)
-                    match.matched_excerpts = result.get("excerpts", [])
-                except Exception:
-                    match.matched_excerpts = []
-        
-        await asyncio.gather(*[extract_for_node(m) for m in matches])
+        await asyncio.gather(*[process_batch(b) for b in batches])
     
     async def _generate_summary(
         self,
@@ -2307,7 +2332,8 @@ Provide a comprehensive summary of:
 
 Summary:"""
 
-        return await self.llm.complete(prompt)
+        # Uses scoring_llm (cheap model) since input is pre-structured
+        return await self._cached_llm_complete(prompt, llm=self.scoring_llm)
 ```
 
 ---
@@ -2320,14 +2346,14 @@ documentindex/
 ├── models.py             # Data models (TreeNode, DocumentIndex, etc.)
 ├── chunker.py            # Text chunking with semantic boundaries
 ├── detector.py           # Financial document type detection
-├── indexer.py            # Tree structure builder
+├── indexer.py            # Tree structure builder (multi-model, LLM-skip, token-aware batching)
 ├── metadata.py           # Metadata extraction
 ├── cross_ref.py          # Cross-reference detection and resolution
 ├── llm_client.py         # Multi-provider LLM client (litellm)
 ├── cache.py              # Caching layer (memory, file, Redis)
-├── searcher.py           # Node search (foundation for retrieval)
+├── searcher.py           # Node search (LLM caching, batched cross-refs, configurable concurrency)
 ├── agentic_qa.py         # Agentic question answering
-├── provenance.py         # Provenance extraction
+├── provenance.py         # Provenance extraction (multi-model, batched excerpts, full content)
 └── utils.py              # Utility functions
 ```
 

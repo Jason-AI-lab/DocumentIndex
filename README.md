@@ -13,12 +13,14 @@ Unlike vector similarity search, DocumentIndex uses LLM reasoning to understand 
 
 ## Features
 
-- 📄 **Hierarchical Tree Indexing**: Understands document structure (PART, ITEM, Note, etc.)
+- 📄 **Hierarchical Tree Indexing**: Understands document structure (PART, ITEM, Note, etc.) with LLM-skip for well-sectioned documents
 - 🤖 **Multi-Provider LLM Support**: OpenAI, Anthropic, AWS Bedrock, Azure OpenAI, Ollama
+- 🧠 **Multi-Model Routing**: Use cheaper models for scoring/summaries, capable models for structure detection and excerpt extraction
 - 🔍 **Dual Retrieval Modes**: Agentic QA and Provenance Extraction
+- ⚡ **Token-Aware Batching**: Intelligent grouping of LLM calls by token budget to minimize API round-trips and cost
 - 📊 **Streaming Responses**: Real-time progress tracking and streaming outputs
-- 💾 **Caching**: Memory, file, and Redis backends
-- 🔗 **Cross-Reference Resolution**: Automatically resolves "see Note 15", "refer to Item 1A"
+- 💾 **LLM-Level Caching**: Response caching across all components (memory, file, and Redis backends)
+- 🔗 **Cross-Reference Resolution**: Automatically resolves "see Note 15", "refer to Item 1A" with batched scoring
 - 📝 **Metadata Extraction**: Company info, dates, financial numbers
 
 ## Installation
@@ -67,9 +69,10 @@ asyncio.run(main())
 ```python
 from documentindex import DocumentIndexer, IndexerConfig, LLMConfig
 
-# Configure indexer
+# Configure indexer with multi-model support
 config = IndexerConfig(
-    llm_config=LLMConfig(model="gpt-4o"),
+    llm_config=LLMConfig(model="gpt-4o"),            # Structure detection
+    summary_llm_config=LLMConfig(model="gpt-4o-mini"), # Cheaper model for summaries
     generate_summaries=True,
     extract_metadata=True,
 )
@@ -134,9 +137,14 @@ doc_index = await indexer.index_with_progress(
 ### Use Case 4: Provenance Extraction
 
 ```python
-from documentindex import ProvenanceExtractor, ProvenanceConfig
+from documentindex import ProvenanceExtractor, ProvenanceConfig, LLMConfig
 
-extractor = ProvenanceExtractor(doc_index)
+# Multi-model: cheap model for scoring, capable model for excerpts
+extractor = ProvenanceExtractor(
+    doc_index,
+    llm_config=LLMConfig(model="gpt-4o"),              # Excerpt extraction
+    scoring_llm_config=LLMConfig(model="gpt-4o-mini"),  # Scoring + summary
+)
 
 # Extract evidence for single topic
 result = await extractor.extract_all(
@@ -144,10 +152,12 @@ result = await extractor.extract_all(
     config=ProvenanceConfig(
         relevance_threshold=0.6,
         extract_excerpts=True,
+        excerpt_threshold=0.75,       # Only extract excerpts for high-confidence matches
+        excerpt_token_budget=30000,   # Token budget per excerpt batch
     ),
 )
 
-# Multiple topics
+# Multiple topics (scoring cache shared across topics)
 topics = {
     "climate": "climate change and environmental risks",
     "regulatory": "regulatory compliance requirements",
@@ -259,6 +269,7 @@ cache = CacheManager(config)
 ```python
 indexer = DocumentIndexer(config, cache_manager=cache)
 searcher = NodeSearcher(doc_index, cache_manager=cache)
+extractor = ProvenanceExtractor(doc_index, cache_manager=cache)
 ```
 
 ## Supported Document Types

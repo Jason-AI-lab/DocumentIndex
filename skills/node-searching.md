@@ -17,14 +17,19 @@ matches = await searcher.find_related_nodes("revenue growth")
 
 # With configuration
 config = NodeSearchConfig(
-    relevance_threshold=0.7,    # Min score to include (0-1)
-    max_results=20,             # Max nodes to return
-    include_children=True,      # Include child nodes
-    follow_cross_refs=True,     # Follow cross-references
-    use_cache=True,             # Cache results
-    batch_size=10               # Nodes to score per LLM call
+    relevance_threshold=0.7,       # Min score to include (0-1)
+    max_results=20,                # Max nodes to return
+    include_children=True,         # Include child nodes
+    follow_cross_refs=True,        # Follow cross-references
+    use_cache=True,                # Cache results
+    batch_size=10,                 # Nodes to score per LLM call
+    max_concurrent_batches=3,      # Parallel batch processing limit
 )
 matches = await searcher.find_related_nodes("revenue growth", config)
+
+# With cache manager for LLM-level response caching
+searcher = NodeSearcher(doc_index, llm_client=llm_client, cache_manager=cache)
+matches = await searcher.find_related_nodes("revenue growth")
 ```
 
 ## Key Features
@@ -40,14 +45,22 @@ matches = await searcher.find_related_nodes("revenue growth", config)
 - Useful for debugging and validation
 
 ### 3. Cross-Reference Expansion
+
 - Follows "See Note 15" style references
-- Expands search to related sections
+- All cross-referenced nodes scored in a single batched LLM call (not individually)
 - Configurable via `follow_cross_refs=True`
 
 ### 4. Batch Processing
-- Processes multiple nodes per LLM call
+
+- Processes multiple nodes per LLM call with configurable concurrency
 - Reduces API costs and latency
-- Configurable via `batch_size`
+- Configurable via `batch_size` and `max_concurrent_batches`
+
+### 5. LLM Response Caching
+
+- Individual LLM scoring calls are cached (not just final search results)
+- Cache shared across components (provenance reuses scoring cache)
+- Requires `cache_manager` passed to constructor
 
 ## Configuration Options
 
@@ -59,6 +72,7 @@ matches = await searcher.find_related_nodes("revenue growth", config)
 | `follow_cross_refs` | bool | True | Follow cross-references |
 | `use_cache` | bool | True | Enable result caching |
 | `batch_size` | int | 10 | Nodes to score per LLM call |
+| `max_concurrent_batches` | int | 3 | Parallel batch processing limit |
 
 ## Output Structure
 
@@ -127,11 +141,13 @@ for query in queries:
 
 - **Search time**: ~2-5 seconds for typical 30-40 node document
 - **API costs**: ~$0.01-0.05 per search depending on document size
-- **Caching effectiveness**: 100% speedup for repeated queries
+- **LLM caching**: Individual scoring calls are cached, so repeated/overlapping queries avoid redundant LLM calls
+- **Cross-ref batching**: All cross-referenced nodes scored in a single batch call instead of N individual calls
 - **Recommended settings for production**:
   - `relevance_threshold=0.6` (good precision/recall balance)
   - `batch_size=10` (standard efficiency)
-  - `use_cache=True` (essential for performance)
+  - `max_concurrent_batches=3` (balance speed and rate limits)
+  - `use_cache=True` with `cache_manager` (essential for performance)
 
 ## Threshold Tuning Guide
 
