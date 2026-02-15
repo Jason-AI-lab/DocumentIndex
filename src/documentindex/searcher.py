@@ -7,8 +7,9 @@ This is the foundation for both:
 """
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Any
 import asyncio
+import json
 import logging
 
 from .models import DocumentIndex, TreeNode, NodeMatch
@@ -28,18 +29,19 @@ class NodeSearchConfig:
     follow_cross_refs: bool = True  # Follow cross-references
     use_cache: bool = True
     batch_size: int = 10  # Nodes to score per LLM call
+    max_concurrent_batches: int = 3  # Parallel batch processing limit
 
 
 class NodeSearcher:
     """
     Searches document tree for nodes related to a query.
-    
+
     Returns all matching nodes with:
     - Relevance scores
     - Match reasoning
     - Text mapping to original document
     """
-    
+
     def __init__(
         self,
         doc_index: DocumentIndex,
@@ -50,7 +52,7 @@ class NodeSearcher:
         self.doc_index = doc_index
         self.llm = llm_client or LLMClient(llm_config or LLMConfig())
         self.cache = cache_manager
-    
+
     async def find_related_nodes(
         self,
         query: str,
@@ -58,49 +60,49 @@ class NodeSearcher:
     ) -> list[NodeMatch]:
         """
         Find all nodes related to the query.
-        
+
         Args:
             query: Search query or topic
             config: Search configuration
-        
+
         Returns:
             List of matching nodes with relevance scores
         """
         config = config or NodeSearchConfig()
-        
+
         # Check cache
         if config.use_cache and self.cache:
             cached = await self.cache.get_search_result(self.doc_index.doc_id, query)
             if cached:
                 logger.debug(f"Cache hit for query: {query[:50]}...")
                 return cached
-        
+
         # Get all nodes to evaluate
         all_nodes = self.doc_index.get_all_nodes()
-        
+
         if not all_nodes:
             return []
-        
+
         # Score nodes in batches
         matches = await self._score_nodes_batched(all_nodes, query, config)
-        
+
         # Filter by threshold and sort
         matches = [m for m in matches if m.relevance_score >= config.relevance_threshold]
         matches.sort(key=lambda m: m.relevance_score, reverse=True)
-        
+
         # Limit results
         matches = matches[:config.max_results]
-        
+
         # Follow cross-references if enabled
         if config.follow_cross_refs and matches:
             matches = await self._expand_with_cross_refs(matches, query, config)
-        
+
         # Cache results
         if config.use_cache and self.cache:
             await self.cache.set_search_result(self.doc_index.doc_id, query, matches)
-        
+
         return matches
-    
+
     async def find_related_nodes_with_progress(
         self,
         query: str,
@@ -109,17 +111,17 @@ class NodeSearcher:
     ) -> list[NodeMatch]:
         """Find related nodes with progress reporting"""
         config = config or NodeSearchConfig()
-        
+
         all_nodes = self.doc_index.get_all_nodes()
         total_batches = (len(all_nodes) + config.batch_size - 1) // config.batch_size
-        
+
         matches: list[NodeMatch] = []
-        
+
         for i in range(0, len(all_nodes), config.batch_size):
             batch = all_nodes[i:i + config.batch_size]
             batch_matches = await self._score_batch(batch, query)
             matches.extend(batch_matches)
-            
+
             if progress_callback:
                 batch_num = i // config.batch_size + 1
                 progress_callback(ProgressUpdate(
@@ -129,14 +131,14 @@ class NodeSearcher:
                     step_name=f"Scoring batch {batch_num}/{total_batches}",
                     message=f"Found {len([m for m in matches if m.relevance_score >= config.relevance_threshold])} relevant nodes",
                 ))
-        
+
         # Filter and sort
         matches = [m for m in matches if m.relevance_score >= config.relevance_threshold]
         matches.sort(key=lambda m: m.relevance_score, reverse=True)
         matches = matches[:config.max_results]
-        
+
         return matches
-    
+
     async def _score_nodes_batched(
         self,
         nodes: list[TreeNode],
@@ -146,23 +148,22 @@ class NodeSearcher:
         """Score all nodes in batches"""
         batch_size = config.batch_size
         batches = [nodes[i:i + batch_size] for i in range(0, len(nodes), batch_size)]
-        
+
         all_matches: list[NodeMatch] = []
-        
-        # Process batches concurrently (with some limit)
-        semaphore = asyncio.Semaphore(3)  # Max concurrent batches
-        
+
+        semaphore = asyncio.Semaphore(config.max_concurrent_batches)
+
         async def process_batch(batch: list[TreeNode]) -> list[NodeMatch]:
             async with semaphore:
                 return await self._score_batch(batch, query)
-        
+
         results = await asyncio.gather(*[process_batch(b) for b in batches])
-        
+
         for batch_matches in results:
             all_matches.extend(batch_matches)
-        
+
         return all_matches
-    
+
     async def _score_batch(
         self,
         nodes: list[TreeNode],
@@ -171,7 +172,7 @@ class NodeSearcher:
         """Score a batch of nodes for relevance"""
         if not nodes:
             return []
-        
+
         # Build node descriptions
         node_descriptions = []
         for node in nodes:
@@ -179,9 +180,9 @@ class NodeSearcher:
             if node.summary:
                 desc += f" - {node.summary[:150]}"
             node_descriptions.append(desc)
-        
+
         nodes_text = "\n".join(node_descriptions)
-        
+
         prompt = f"""Evaluate how relevant each document section is to this query/topic.
 
 Query: {query}
@@ -207,17 +208,17 @@ Return JSON array:
 Include ALL sections in your response."""
 
         try:
-            results = await self.llm.complete_json(prompt)
-            
+            results = await self._cached_llm_complete_json(prompt)
+
             if not isinstance(results, list):
                 results = []
-            
+
             # Build result map
             result_map = {}
             for r in results:
                 if isinstance(r, dict) and "node_id" in r:
                     result_map[r["node_id"]] = r
-            
+
             matches = []
             for node in nodes:
                 if node.node_id in result_map:
@@ -228,15 +229,15 @@ Include ALL sections in your response."""
                     # Node not in results, assign low score
                     score = 0.1
                     reason = "Not evaluated"
-                
+
                 matches.append(NodeMatch(
                     node=node,
                     relevance_score=score,
                     match_reason=reason,
                 ))
-            
+
             return matches
-            
+
         except Exception as e:
             logger.warning(f"Batch scoring failed: {e}")
             # Return all with neutral score on error
@@ -244,30 +245,106 @@ Include ALL sections in your response."""
                 NodeMatch(node=n, relevance_score=0.3, match_reason="Scoring error")
                 for n in nodes
             ]
-    
+
     async def _expand_with_cross_refs(
         self,
         matches: list[NodeMatch],
         query: str,
         config: NodeSearchConfig,
     ) -> list[NodeMatch]:
-        """Expand results by following cross-references"""
+        """Expand results by following cross-references (batched)"""
         matched_ids = {m.node.node_id for m in matches}
-        additional: list[NodeMatch] = []
-        
+        targets_to_score: list[TreeNode] = []
+
+        # Collect all unscored cross-referenced nodes
         for match in matches:
             for ref in match.node.cross_references:
                 if ref.resolved and ref.target_node_id and ref.target_node_id not in matched_ids:
                     target = self.doc_index.find_node(ref.target_node_id)
                     if target:
-                        # Score the referenced node
-                        ref_matches = await self._score_batch([target], query)
-                        if ref_matches and ref_matches[0].relevance_score >= config.relevance_threshold:
-                            additional.append(ref_matches[0])
-                            matched_ids.add(target.node_id)
-        
+                        targets_to_score.append(target)
+                        matched_ids.add(target.node_id)  # Prevent duplicates
+
+        if not targets_to_score:
+            return matches
+
+        # Score all cross-referenced nodes in batch(es)
+        additional: list[NodeMatch] = []
+        batch_size = config.batch_size
+        for i in range(0, len(targets_to_score), batch_size):
+            batch = targets_to_score[i:i + batch_size]
+            ref_matches = await self._score_batch(batch, query)
+            for m in ref_matches:
+                if m.relevance_score >= config.relevance_threshold:
+                    additional.append(m)
+
         return matches + additional
-    
+
+    # -------------------------------------------------------------------------
+    # Caching
+    # -------------------------------------------------------------------------
+
+    async def _cached_llm_complete_json(
+        self,
+        prompt: str,
+        llm: Optional[LLMClient] = None,
+    ) -> Any:
+        """JSON LLM completion with caching.
+
+        Caches the parsed JSON so cache hits skip extraction/fixup logic.
+        """
+        client = llm or self.llm
+        cache_key_suffix = ":json"
+
+        if self.cache:
+            model = client.config.model
+            cached = await self.cache.get_llm_response(
+                prompt + cache_key_suffix, model
+            )
+            if cached is not None:
+                logger.debug("Cache hit for searcher LLM JSON prompt")
+                try:
+                    return json.loads(cached)
+                except json.JSONDecodeError:
+                    pass  # Corrupted cache entry, re-fetch
+
+        response = await client.complete(prompt, response_format="json")
+        parsed = client._extract_json(response)
+
+        if self.cache:
+            await self.cache.set_llm_response(
+                prompt + cache_key_suffix,
+                client.config.model,
+                json.dumps(parsed),
+            )
+
+        return parsed
+
+    async def _cached_llm_complete(
+        self,
+        prompt: str,
+        llm: Optional[LLMClient] = None,
+    ) -> str:
+        """LLM completion with caching."""
+        client = llm or self.llm
+        if self.cache:
+            model = client.config.model
+            cached = await self.cache.get_llm_response(prompt, model)
+            if cached is not None:
+                logger.debug("Cache hit for searcher LLM prompt")
+                return cached
+
+        response = await client.complete(prompt)
+
+        if self.cache:
+            await self.cache.set_llm_response(prompt, client.config.model, response)
+
+        return response
+
+    # -------------------------------------------------------------------------
+    # Utilities
+    # -------------------------------------------------------------------------
+
     def get_node_with_context(
         self,
         node_id: str,
@@ -275,23 +352,23 @@ Include ALL sections in your response."""
     ) -> Optional[str]:
         """
         Get node text with surrounding context.
-        
+
         Args:
             node_id: Node ID to retrieve
             context_chunks: Number of chunks of context on each side
-        
+
         Returns:
             Text with context
         """
         node = self.doc_index.find_node(node_id)
         if not node:
             return None
-        
+
         start = max(0, node.start_index - context_chunks)
         end = min(len(self.doc_index.chunks), node.end_index + context_chunks)
-        
+
         return self.doc_index.get_chunk_text(start, end)
-    
+
     def get_node_text(self, node_id: str) -> Optional[str]:
         """Get full text for a node"""
         return self.doc_index.get_node_text(node_id)
@@ -310,14 +387,14 @@ async def search_nodes(
 ) -> list[NodeMatch]:
     """
     Convenience function to search for related nodes.
-    
+
     Args:
         doc_index: Document index to search
         query: Search query
         threshold: Minimum relevance score
         max_results: Maximum results to return
         model: LLM model to use
-    
+
     Returns:
         List of matching nodes
     """
