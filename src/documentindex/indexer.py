@@ -14,6 +14,7 @@ The indexer:
 from dataclasses import dataclass, field
 from typing import Optional, Any
 import asyncio
+import json
 import uuid
 import logging
 import re
@@ -40,6 +41,7 @@ class IndexerConfig:
     """Configuration for document indexer"""
     # LLM settings
     llm_config: Optional[LLMConfig] = None
+    summary_llm_config: Optional[LLMConfig] = None  # Cheaper model for summaries (defaults to llm_config)
 
     # Chunking settings
     chunk_config: Optional[ChunkConfig] = None
@@ -56,6 +58,10 @@ class IndexerConfig:
     # Batch summary settings
     summary_batch_size: int = 10  # Nodes per batch LLM call
     max_concurrent_batches: int = 3  # Parallel batch processing limit
+    summary_token_budget: int = 8000  # Max input tokens per summary batch
+
+    # Small document optimization
+    small_doc_threshold: int = 15  # Chunks - documents smaller than this use combined structure+summary
 
     # Cache
     use_cache: bool = True
@@ -77,6 +83,11 @@ class DocumentIndexer:
     ):
         self.config = config or IndexerConfig()
         self.llm = llm_client or LLMClient(self.config.llm_config or LLMConfig())
+        self.summary_llm = (
+            LLMClient(self.config.summary_llm_config)
+            if self.config.summary_llm_config
+            else self.llm
+        )
         self.chunker = TextChunker(self.config.chunk_config)
         self.cache = cache_manager
         
@@ -165,26 +176,42 @@ class DocumentIndexer:
 
         logger.info(f"Created {len(chunks)} chunks")
         
-        # Step 3: Build structure
-        reporter.report("Structure Building", f"Analyzing {len(chunks)} chunks")
-        structure = await self._build_structure(chunks, doc_type)
-        
-        logger.info(f"Built structure with {len(structure)} root nodes")
-        
-        # Step 4: Generate summaries
-        if self.config.generate_summaries and structure:
-            reporter.report("Summary Generation", f"Summarizing sections")
-            await self._generate_summaries(structure, chunk_texts)
+        # Step 3 & 4: Build structure (and optionally generate summaries in one call)
+        summaries_done = False
+        if (
+            self.config.generate_summaries
+            and len(chunks) <= self.config.small_doc_threshold
+        ):
+            # Small document: combine structure + summary in a single LLM call
+            reporter.report(
+                "Structure + Summaries",
+                f"Analyzing {len(chunks)} chunks (combined)",
+            )
+            structure = await self._build_structure_with_summaries(chunks, doc_type)
+            summaries_done = True
+            logger.info(f"Built structure with summaries: {len(structure)} root nodes")
         else:
-            reporter.report("Summary Generation", "Skipped")
-        
-        # Step 5: Extract metadata
-        if self.config.extract_metadata:
-            reporter.report("Metadata Extraction", "Extracting document metadata")
-            metadata = self.metadata_extractor.extract_sync(text, doc_type, doc_name)
-        else:
-            reporter.report("Metadata Extraction", "Skipped")
-            metadata = DocumentMetadata()
+            reporter.report("Structure Building", f"Analyzing {len(chunks)} chunks")
+            structure = await self._build_structure(chunks, doc_type)
+            logger.info(f"Built structure with {len(structure)} root nodes")
+
+        # Step 4 & 5: Generate summaries + extract metadata in parallel
+        async def _run_summaries():
+            if not summaries_done and self.config.generate_summaries and structure:
+                reporter.report("Summary Generation", "Summarizing sections")
+                await self._generate_summaries(structure, chunk_texts)
+            elif not summaries_done:
+                reporter.report("Summary Generation", "Skipped")
+
+        async def _run_metadata():
+            if self.config.extract_metadata:
+                reporter.report("Metadata Extraction", "Extracting document metadata")
+                return self.metadata_extractor.extract_sync(text, doc_type, doc_name)
+            else:
+                reporter.report("Metadata Extraction", "Skipped")
+                return DocumentMetadata()
+
+        _, metadata = await asyncio.gather(_run_summaries(), _run_metadata())
         
         # Step 6: Create document index (needed for cross-ref resolution)
         reporter.report("Building Index", "Creating index structure")
@@ -216,30 +243,186 @@ class DocumentIndexer:
         chunks: list[Chunk],
         doc_type: DocumentType,
     ) -> list[TreeNode]:
-        """Build hierarchical structure using LLM"""
+        """Build hierarchical structure, skipping LLM when chunks have clear section metadata"""
         if not chunks:
             return []
 
-        # Build chunk summary for structure detection
+        # Check if chunks already have sufficient section metadata from the chunker
+        sections_found = [c for c in chunks if c.section_title]
+        distinct_sections = len(set(c.section_title for c in sections_found))
+
+        if distinct_sections >= 3 and len(sections_found) / len(chunks) > 0.2:
+            logger.info(
+                f"Found {distinct_sections} distinct sections in chunk metadata, "
+                "building structure from chunks (skipping LLM)"
+            )
+            return self._build_structure_from_chunks(chunks)
+
+        # Fall through to LLM-based structure detection
         chunks_summary = self._build_chunks_summary(chunks)
 
-        # Get type-specific prompt
         if doc_type == DocumentType.EARNINGS_CALL:
             prompt = self._earnings_call_structure_prompt(chunks_summary, len(chunks))
         else:
             prompt = self._generic_structure_prompt(chunks_summary, doc_type)
 
         try:
-            result = await self.llm.complete_json(prompt)
+            result = await self._cached_llm_complete_json(prompt)
 
             if isinstance(result, list):
-                # Convert to TreeNodes
                 return self._build_tree_from_flat(result, chunks)
             else:
                 logger.warning("LLM returned non-list structure, using fallback")
                 return self._build_fallback_structure(chunks)
         except Exception as e:
             logger.warning(f"Structure detection failed: {e}, using fallback")
+            return self._build_fallback_structure(chunks)
+
+    def _build_structure_from_chunks(self, chunks: list[Chunk]) -> list[TreeNode]:
+        """Build hierarchical tree directly from chunk section metadata (no LLM needed)"""
+        # Group consecutive chunks by section, respecting hierarchy levels
+        sections: list[dict] = []
+        current_title = None
+        current_level = 0
+        current_start = 0
+
+        for i, chunk in enumerate(chunks):
+            if chunk.section_title and chunk.section_title != current_title:
+                if current_title is not None:
+                    sections.append({
+                        "title": current_title,
+                        "level": current_level,
+                        "start_chunk": current_start,
+                        "end_chunk": i,
+                    })
+                current_title = chunk.section_title
+                current_level = chunk.section_level
+                current_start = i
+            elif not chunk.section_title and current_title is None:
+                # Chunks before any section header
+                current_title = "Introduction"
+                current_level = 0
+                current_start = i
+
+        # Add final section
+        if current_title is not None:
+            sections.append({
+                "title": current_title,
+                "level": current_level,
+                "start_chunk": current_start,
+                "end_chunk": len(chunks),
+            })
+
+        if not sections:
+            return self._build_fallback_structure(chunks)
+
+        # Build hierarchical tree from flat sections with levels
+        root_nodes: list[TreeNode] = []
+        stack: list[TreeNode] = []  # Stack of parent nodes
+
+        for i, section in enumerate(sections):
+            start_chunk = section["start_chunk"]
+            end_chunk = section["end_chunk"]
+            level = section["level"]
+
+            node = TreeNode(
+                node_id=f"{i:04d}",
+                title=section["title"],
+                level=level,
+                text_span=TextSpan(
+                    start_char=chunks[start_chunk].start_char,
+                    end_char=chunks[min(end_chunk, len(chunks)) - 1].end_char,
+                    start_chunk=start_chunk,
+                    end_chunk=end_chunk,
+                ),
+            )
+
+            # Find appropriate parent by popping stack until we find a node at a lower level
+            while stack and stack[-1].level >= level:
+                stack.pop()
+
+            if stack:
+                parent = stack[-1]
+                node.parent_id = parent.node_id
+                parent.children.append(node)
+                # Expand parent span to include this child
+                parent.text_span = TextSpan(
+                    start_char=parent.text_span.start_char,
+                    end_char=max(parent.text_span.end_char, node.text_span.end_char),
+                    start_chunk=parent.text_span.start_chunk,
+                    end_chunk=max(parent.text_span.end_chunk, node.text_span.end_chunk),
+                )
+            else:
+                root_nodes.append(node)
+
+            stack.append(node)
+
+        return root_nodes
+
+    async def _build_structure_with_summaries(
+        self,
+        chunks: list[Chunk],
+        doc_type: DocumentType,
+    ) -> list[TreeNode]:
+        """Build structure AND generate summaries in a single LLM call for small documents."""
+        if not chunks:
+            return []
+
+        # Include full chunk text (small doc, so this fits in context)
+        chunk_content = []
+        for i, chunk in enumerate(chunks):
+            section_info = f" [{chunk.section_title}]" if chunk.section_title else ""
+            preview = chunk.text[:500].replace('\n', ' ').strip()
+            chunk_content.append(f"<chunk_{i}>{section_info}: {preview}")
+
+        chunks_text = "\n".join(chunk_content)
+
+        prompt = f"""Analyze this document and provide both its hierarchical structure and a 2-3 sentence summary for each section.
+
+Document type: {doc_type.value}
+
+The document has {len(chunks)} chunks:
+
+{chunks_text}
+
+Return a JSON array where each object has:
+- structure: Hierarchical number ("1", "1.1", etc.)
+- title: Section title
+- chunk_index: Starting chunk index (0-based)
+- end_chunk_index: Ending chunk index (exclusive)
+- summary: 2-3 sentence summary of this section
+
+Example:
+[
+  {{"structure": "1", "title": "PART I", "chunk_index": 0, "end_chunk_index": 3, "summary": "Overview of..."}},
+  {{"structure": "1.1", "title": "Item 1. Business", "chunk_index": 0, "end_chunk_index": 2, "summary": "Describes..."}}
+]
+
+Return valid JSON array only."""
+
+        try:
+            result = await self._cached_llm_complete_json(prompt)
+
+            if isinstance(result, list):
+                nodes = self._build_tree_from_flat(result, chunks)
+                # Apply summaries from the combined response
+                nodes_by_id: dict[str, TreeNode] = {}
+                all_nodes: list[TreeNode] = []
+                self._collect_all_nodes(nodes, all_nodes)
+                for n in all_nodes:
+                    nodes_by_id[n.node_id] = n
+
+                for i, item in enumerate(result):
+                    node_id = f"{i:04d}"
+                    if node_id in nodes_by_id and "summary" in item:
+                        nodes_by_id[node_id].summary = str(item["summary"])[:500]
+
+                return nodes
+            else:
+                logger.warning("Combined call returned non-list, falling back")
+                return self._build_fallback_structure(chunks)
+        except Exception as e:
+            logger.warning(f"Combined structure+summary failed: {e}, falling back")
             return self._build_fallback_structure(chunks)
 
     def _generic_structure_prompt(self, chunks_summary: str, doc_type: DocumentType) -> str:
@@ -307,17 +490,31 @@ Return a JSON array with 3 to 6 objects:
 Return valid JSON array only."""
     
     def _build_chunks_summary(self, chunks: list[Chunk]) -> str:
-        """Build summary of chunks for LLM"""
+        """Build summary of chunks for LLM, focusing on section boundaries.
+
+        Shows all chunks with section titles (structural boundaries) with previews,
+        and collapses runs of content-only chunks into counts.  This ensures the LLM
+        sees the full document structure regardless of document size.
+        """
         lines = []
-        for i, chunk in enumerate(chunks[:50]):  # Limit chunks shown
-            # Get first 200 chars of chunk, clean up whitespace
-            preview = chunk.text[:200].replace('\n', ' ').strip()
-            section_info = f" [{chunk.section_title}]" if chunk.section_title else ""
-            lines.append(f"<chunk_{i}>{section_info}: {preview}...")
-        
-        if len(chunks) > 50:
-            lines.append(f"... and {len(chunks) - 50} more chunks")
-        
+        content_run = 0  # count of consecutive chunks without section_title
+
+        for i, chunk in enumerate(chunks):
+            if chunk.section_title:
+                # Flush any accumulated content-only chunks
+                if content_run > 0:
+                    lines.append(f"  ... {content_run} content chunk(s) ...")
+                    content_run = 0
+                preview = chunk.text[:200].replace('\n', ' ').strip()
+                lines.append(f"<chunk_{i}> [{chunk.section_title}]: {preview}...")
+            else:
+                content_run += 1
+
+        # Flush trailing content-only chunks
+        if content_run > 0:
+            lines.append(f"  ... {content_run} content chunk(s) ...")
+
+        lines.append(f"\nTotal: {len(chunks)} chunks")
         return "\n".join(lines)
     
     def _build_tree_from_flat(
@@ -489,47 +686,123 @@ Return valid JSON array only."""
         nodes: list[TreeNode],
         chunks: list[str],
     ) -> None:
-        """Generate summaries using batched LLM calls (more efficient)"""
+        """Generate summaries using batched LLM calls with bottom-up parent synthesis.
+
+        Leaf nodes are summarized from raw text via batched LLM calls.
+        Parent nodes are then synthesized from their children's summaries,
+        avoiding redundant processing of overlapping text.
+        """
         all_nodes: list[TreeNode] = []
         self._collect_all_nodes(nodes, all_nodes)
 
-        # Filter to only nodes with substantial content
-        nodes_to_summarize = []
+        # Separate leaf nodes (no children) from parent nodes (have children)
+        leaf_nodes = []
+        parent_nodes = []
         for node in all_nodes:
             text = "\n".join(chunks[node.start_index:node.end_index])
-            if len(text) > 100:
-                nodes_to_summarize.append(node)
-
-        if not nodes_to_summarize:
-            return
-
-        # Create batches
-        batch_size = self.config.summary_batch_size
-        batches = [
-            nodes_to_summarize[i:i + batch_size]
-            for i in range(0, len(nodes_to_summarize), batch_size)
-        ]
-
-        logger.info(f"Generating summaries for {len(nodes_to_summarize)} nodes in {len(batches)} batches")
-
-        # Process batches with concurrency limit
-        semaphore = asyncio.Semaphore(self.config.max_concurrent_batches)
-
-        async def process_batch(batch: list[TreeNode]) -> dict[str, str]:
-            async with semaphore:
-                return await self._generate_batch_summaries(batch, chunks)
-
-        results = await asyncio.gather(*[process_batch(b) for b in batches], return_exceptions=True)
-
-        # Apply summaries to nodes
-        for result in results:
-            if isinstance(result, Exception):
-                logger.warning(f"Batch failed: {result}")
+            if len(text) <= 100:
                 continue
-            for node_id, summary in result.items():
-                node = self._find_node_by_id(all_nodes, node_id)
-                if node:
-                    node.summary = summary
+            if node.children:
+                parent_nodes.append(node)
+            else:
+                leaf_nodes.append(node)
+
+        # Phase 1: Summarize leaf nodes from raw text via batched LLM calls
+        if leaf_nodes:
+            batches = self._create_token_aware_batches(leaf_nodes, chunks)
+            logger.info(
+                f"Generating summaries for {len(leaf_nodes)} leaf nodes "
+                f"in {len(batches)} batches"
+            )
+
+            semaphore = asyncio.Semaphore(self.config.max_concurrent_batches)
+
+            async def process_batch(batch: list[TreeNode]) -> dict[str, str]:
+                async with semaphore:
+                    return await self._generate_batch_summaries(batch, chunks)
+
+            results = await asyncio.gather(
+                *[process_batch(b) for b in batches], return_exceptions=True
+            )
+
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.warning(f"Batch failed: {result}")
+                    continue
+                for node_id, summary in result.items():
+                    node = self._find_node_by_id(all_nodes, node_id)
+                    if node:
+                        node.summary = summary
+
+        # Phase 2: Synthesize parent summaries from children (bottom-up by level)
+        if parent_nodes:
+            # Sort deepest first so children are summarized before parents
+            parent_nodes.sort(key=lambda n: n.level, reverse=True)
+            logger.info(f"Synthesizing summaries for {len(parent_nodes)} parent nodes")
+
+            for node in parent_nodes:
+                child_summaries = [
+                    f"- {c.title}: {c.summary}"
+                    for c in node.children
+                    if c.summary
+                ]
+                if child_summaries:
+                    prompt = (
+                        f"Synthesize a 2-3 sentence summary for the section "
+                        f'"{node.title}" based on its subsections:\n\n'
+                        + "\n".join(child_summaries)
+                        + "\n\nProvide a concise summary:"
+                    )
+                    try:
+                        summary = await self._cached_llm_complete(
+                            prompt, llm=self.summary_llm
+                        )
+                        node.summary = summary.strip()[:500]
+                    except Exception as e:
+                        logger.warning(f"Parent synthesis failed for {node.title}: {e}")
+                        # Fallback: concatenate child summaries
+                        node.summary = " ".join(
+                            c.summary for c in node.children if c.summary
+                        )[:500]
+                else:
+                    # No child summaries available, summarize from raw text
+                    text = "\n".join(chunks[node.start_index:node.end_index])
+                    node.summary = await self._generate_summary(text, node.title)
+
+    def _create_token_aware_batches(
+        self,
+        nodes: list[TreeNode],
+        chunks: list[str],
+    ) -> list[list[TreeNode]]:
+        """Create batches respecting both token budget and max batch size."""
+        batches: list[list[TreeNode]] = []
+        current_batch: list[TreeNode] = []
+        current_tokens = 0
+        chars_per_token = 3.5
+        max_sample = 2000  # matches _generate_batch_summaries sample size
+
+        for node in nodes:
+            text = "\n".join(chunks[node.start_index:node.end_index])
+            sampled_len = min(len(text), max_sample)
+            estimated_tokens = int(sampled_len / chars_per_token)
+
+            would_exceed_tokens = (
+                current_tokens + estimated_tokens > self.config.summary_token_budget
+            )
+            would_exceed_size = len(current_batch) >= self.config.summary_batch_size
+
+            if current_batch and (would_exceed_tokens or would_exceed_size):
+                batches.append(current_batch)
+                current_batch = []
+                current_tokens = 0
+
+            current_batch.append(node)
+            current_tokens += estimated_tokens
+
+        if current_batch:
+            batches.append(current_batch)
+
+        return batches
 
     async def _generate_batch_summaries(
         self,
@@ -562,7 +835,7 @@ Return a JSON array with summaries for each section:
 Provide summaries for ALL {len(batch)} sections. Return valid JSON array only."""
 
         try:
-            results = await self._cached_llm_complete_json(prompt)
+            results = await self._cached_llm_complete_json(prompt, llm=self.summary_llm)
             if not isinstance(results, list):
                 logger.warning("Batch summary returned non-list, returning empty")
                 return {}
@@ -624,7 +897,7 @@ Content:
 Provide a concise summary focusing on the key information:"""
 
         try:
-            summary = await self._cached_llm_complete(prompt)
+            summary = await self._cached_llm_complete(prompt, llm=self.summary_llm)
             return summary.strip()[:500]  # Limit summary length
         except Exception as e:
             logger.warning(f"Summary generation failed for {title}: {e}")
@@ -663,38 +936,56 @@ Provide a concise summary focusing on the key information:"""
 
         return head.strip() + "\n\n...[content truncated]...\n\n" + tail.strip()
 
-    async def _cached_llm_complete(self, prompt: str) -> str:
+    async def _cached_llm_complete(self, prompt: str, llm: Optional[LLMClient] = None) -> str:
         """LLM completion with optional caching"""
+        client = llm or self.llm
         if self.config.use_cache and self.cache:
-            model = self.llm.config.model
+            model = client.config.model
             cached = await self.cache.get_llm_response(prompt, model)
             if cached is not None:
                 logger.debug("Cache hit for LLM prompt")
                 return cached
 
-        response = await self.llm.complete(prompt)
+        response = await client.complete(prompt)
 
         if self.config.use_cache and self.cache:
-            await self.cache.set_llm_response(prompt, self.llm.config.model, response)
+            await self.cache.set_llm_response(prompt, client.config.model, response)
 
         return response
 
-    async def _cached_llm_complete_json(self, prompt: str) -> Any:
-        """JSON LLM completion with optional caching"""
+    async def _cached_llm_complete_json(self, prompt: str, llm: Optional[LLMClient] = None) -> Any:
+        """JSON LLM completion with optional caching.
+
+        Caches the parsed JSON (serialized via json.dumps) so cache hits
+        skip the extraction/fixup logic entirely.
+        """
+        client = llm or self.llm
+        cache_key_suffix = ":json"  # Distinguish from raw text cache entries
+
         if self.config.use_cache and self.cache:
-            model = self.llm.config.model
-            cached = await self.cache.get_llm_response(prompt, model)
+            model = client.config.model
+            cached = await self.cache.get_llm_response(
+                prompt + cache_key_suffix, model
+            )
             if cached is not None:
                 logger.debug("Cache hit for LLM JSON prompt")
-                # Parse cached string as JSON
-                return self.llm._extract_json(cached)
+                try:
+                    return json.loads(cached)
+                except json.JSONDecodeError:
+                    pass  # Corrupted cache entry, re-fetch
 
-        response = await self.llm.complete(prompt, response_format="json")
+        response = await client.complete(prompt, response_format="json")
+        parsed = client._extract_json(response)
 
         if self.config.use_cache and self.cache:
-            await self.cache.set_llm_response(prompt, self.llm.config.model, response)
+            # Store the clean parsed JSON so we skip _extract_json on cache hits
+            await self.cache.set_llm_response(
+                prompt + cache_key_suffix,
+                client.config.model,
+                json.dumps(parsed),
+            )
 
-        return self.llm._extract_json(response)
+        return parsed
 
 
 # ============================================================================
@@ -706,21 +997,24 @@ async def index_document(
     doc_name: str = "document",
     doc_type: Optional[DocumentType] = None,
     model: str = "gpt-4o",
+    summary_model: Optional[str] = None,
 ) -> DocumentIndex:
     """
     Convenience function to index a document.
-    
+
     Args:
         text: Document text
         doc_name: Document name
         doc_type: Document type (auto-detected if not provided)
-        model: LLM model to use
-    
+        model: LLM model for structure detection (e.g. "gpt-4o", "bedrock/anthropic.claude-sonnet-4-5-20250929")
+        summary_model: Optional cheaper model for summaries (e.g. "gpt-4o-mini", "bedrock/anthropic.claude-haiku-4-5-20251001")
+
     Returns:
         DocumentIndex
     """
     config = IndexerConfig(
         llm_config=LLMConfig(model=model),
+        summary_llm_config=LLMConfig(model=summary_model) if summary_model else None,
     )
     indexer = DocumentIndexer(config)
     return await indexer.index(text, doc_name, doc_type)

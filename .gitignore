@@ -14,3 +14,7 @@ wheels/
 exports
 plan
 .claude
+
+# system files
+.DS_Store
+Thumbs.db
